@@ -113,7 +113,8 @@ Add modular simulated monitoring providers
 Add VytalLink monitoring API
 Add responsive caregiver dashboard
 Validate complete simulated Phase 1 workflow
-Prepare Jetson hardware integration and pilot documentation   (final)
+Prepare Jetson hardware integration and pilot documentation
+Harden alert cooldown, secret redaction, and event-loop safety   (final)
 ```
 
 ## 10. Project structure summary
