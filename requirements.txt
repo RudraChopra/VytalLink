@@ -1,0 +1,15 @@
+# VytalLink Phase 1 runtime dependencies.
+# Minimal, pure-Python where possible. Installed into a project venv created
+# with --system-site-packages so the Jetson-tuned OpenCV / TensorRT / CUDA
+# PyTorch remain available for the vision phase without rebuilding them.
+#
+# Pinned for reproducibility on Python 3.10 / aarch64 (Jetson Orin Nano, L4T R36.3).
+
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+httpx==0.28.1
+jinja2==3.1.6
+psutil==7.0.0
