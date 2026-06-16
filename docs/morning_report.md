@@ -19,7 +19,8 @@ deterministic tests. Real-hardware paths (RTSP camera, YOLO model on GPU, real
 wearable) are implemented as clean adapters and remain **pending** until you
 supply configuration/weights/devices — they are clearly marked, not faked.
 
-- **97 automated tests** — all pass.
+- **103 automated tests** — all pass (includes 6 added during a post-build
+  adversarial review; see §17).
 - **`scripts/diagnose.sh`** — no failures (one expected WARN: CPU-only PyTorch).
 - **`scripts/smoke_test.sh`** — 21/21 checks pass, including persistence across
   a restart.
@@ -62,7 +63,7 @@ supply configuration/weights/devices — they are clearly marked, not faked.
 ## 4. Exact test results
 
 ```
-pytest:        97 passed
+pytest:        103 passed
 diagnose.sh:   Overall WARN (gpu: CPU-only torch — expected), exit 0, no FAIL
 smoke_test.sh: SMOKE TEST: PASS (21/21 required checks), exit 0
 ```
@@ -198,3 +199,32 @@ Then edit `.env` (`VISION_MODE=rtsp`, `CAMERA_SOURCE=...`, `DETECTOR_MODE=yolo`,
 3. **Add dashboard authentication + a real notification channel** (e.g. SMS/push
    behind the existing `AlertProvider` interface) before any pilot with a real
    user, then run the pilot checklist end to end.
+
+## 17. Post-build adversarial review
+
+After the build passed all acceptance criteria, a multi-agent review (5
+dimensions × independent verification of each finding) examined the core
+correctness/security paths. It surfaced 17 findings; 6 were independently
+confirmed and all 6 were fixed (with new tests; suite now 103 passing):
+
+1. **HIGH — alert cooldown armed on request, not delivery.** The state machine
+   armed the cooldown synchronously at confirmation, so a *failed* first alert
+   (e.g. webhook down) would silently suppress the alert for the next real fall.
+   Fixed: the SM now only *requests* an alert; the EventManager arms the cooldown
+   (`commit_alert`) only when a provider actually delivers, and cancels it
+   otherwise. New regression tests at both the SM and manager level.
+2. **MEDIUM — blocking I/O on the event loop (live mode).** Camera reads and
+   model inference are now offloaded via `asyncio.to_thread`, so a slow/bad RTSP
+   source can't freeze the API. (Affects the future live path.)
+3. **MEDIUM — `sanitize_url` could leak a password containing `@`.** Rebuilt
+   redaction from the parsed host/port instead of string-splitting on `@`.
+4. **MEDIUM — `sanitize_url` didn't redact scheme-less URLs.** Now handles
+   `user:pass@host/path` and IPv6 hosts. New tests cover all cases.
+5. **LOW — `resolve_event` double clock-read** (`resolved_time` could exceed
+   `end_time`) and redundant double UPDATE. Now a single clock read; the SM's
+   values are persisted once.
+6. **LOW — unreachable `POSSIBLE_FALL` branch** in `resolve_event` (a possible
+   event has no DB row). Removed from the live-resolve states.
+
+The other 11 findings were either refuted on verification or low-confidence/
+stylistic and were not actioned.

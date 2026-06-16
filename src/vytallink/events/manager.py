@@ -107,6 +107,8 @@ class EventManager:
         if ev is None or self.dispatcher is None:
             if self.dispatcher is None:
                 log.warning("Alert requested for %s but no dispatcher configured", t.event_uid)
+            # Nothing delivered → do not arm the cooldown.
+            self.sm.cancel_pending_alert()
             return
         alert = AlertEvent(
             event_uid=ev.event_uid,
@@ -123,6 +125,15 @@ class EventManager:
             # Defense in depth: never let an alert failure crash observation.
             log.error("Alert dispatch raised unexpectedly for %s: %s", ev.event_uid, exc)
             self.last_alert_results = []
+        # Arm the alert cooldown ONLY if at least one provider actually delivered.
+        # A failed delivery must not suppress the alert for the next real fall.
+        if any(getattr(r, "success", False) for r in self.last_alert_results):
+            self.sm.commit_alert()
+        else:
+            self.sm.cancel_pending_alert()
+            log.warning(
+                "Alert for %s not delivered by any provider; cooldown not armed", ev.event_uid
+            )
 
     # -- caregiver operations ---------------------------------------------
     async def label_event(self, event_uid: str, label: str) -> EventRow:
@@ -140,24 +151,29 @@ class EventManager:
         state machine to RESOLVED."""
         async with self._lock:
             existing = self.repos.events.require(event_uid)
+            now = self.clock.now()  # single clock read for consistent timestamps
             live = self.sm.current_event
             fields: dict[str, Any] = {"resolution_note": note} if note is not None else {}
-            if live is not None and live.event_uid == event_uid and self.sm.state in (
-                FallState.CONFIRMED_FALL,
-                FallState.RECOVERING,
-                FallState.POSSIBLE_FALL,
-            ):
-                transitions = self.sm.manual_resolve()
-                for t in transitions:
+            # Only CONFIRMED/RECOVERING events are both live AND persisted; a
+            # POSSIBLE event has no DB row (require() above would have raised),
+            # so it is not a resolvable live state here.
+            is_live = (
+                live is not None
+                and live.event_uid == event_uid
+                and self.sm.state in (FallState.CONFIRMED_FALL, FallState.RECOVERING)
+            )
+            if is_live:
+                # The state machine sets resolved_time/end_time; _persist_transition
+                # writes them. We only add the caregiver note here (no duplicate
+                # state/time writes, no second clock read).
+                for t in self.sm.manual_resolve(now=now):
                     self._persist_transition(t)
-                fields["state"] = FallState.RESOLVED.value
-                fields["resolved_time"] = isoformat(self.clock.now())
             elif existing.state != FallState.RESOLVED.value:
                 fields["state"] = FallState.RESOLVED.value
-                fields["resolved_time"] = existing.resolved_time or isoformat(self.clock.now())
+                fields["resolved_time"] = existing.resolved_time or isoformat(now)
                 if existing.end_time is None:
-                    fields["end_time"] = isoformat(self.clock.now())
-            row = self.repos.events.update(event_uid, **fields) if fields else existing
+                    fields["end_time"] = isoformat(now)
+            row = self.repos.events.update(event_uid, **fields) if fields else self.repos.events.require(event_uid)
             log.info("Event %s resolved (note=%s)", event_uid, bool(note))
             return row
 

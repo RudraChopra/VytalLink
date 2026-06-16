@@ -151,6 +151,66 @@ async def test_second_event_after_cooldown_two_events_two_alerts(repos, manual_c
     assert repos.alerts.count() == 2
 
 
+class FailingDispatcher:
+    """Records a failed attempt and reports no successful delivery."""
+
+    def __init__(self, repos, clock):
+        self.repos = repos
+        self.clock = clock
+        self.calls: list[AlertEvent] = []
+
+    async def dispatch(self, alert: AlertEvent) -> list[AlertResult]:
+        self.calls.append(alert)
+        self.repos.alerts.record(
+            AlertRow(
+                event_uid=alert.event_uid,
+                provider="flaky",
+                attempt_time=isoformat(alert.timestamp),
+                success=False,
+                failure_message="webhook down",
+            )
+        )
+        return [
+            AlertResult(
+                provider="flaky", success=False, attempt_time=self.clock.now(),
+                failure_message="webhook down",
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_failed_first_alert_does_not_suppress_next_real_fall(repos, manual_clock):
+    # The HIGH-severity safety regression: a failed first alert must not arm the
+    # cooldown, so a second real fall within the cooldown window still alerts.
+    import itertools
+
+    counter = itertools.count(1)
+    sm = FallEventStateMachine(
+        confirm_seconds=2.0, clear_seconds=3.0, cooldown_seconds=30.0,
+        clock=manual_clock, uid_factory=lambda: f"evt-{next(counter)}",
+    )
+    disp = FailingDispatcher(repos, manual_clock)
+    mgr = EventManager(repos, sm, disp, clock=manual_clock, simulated=True)
+
+    await drive_confirm(mgr, manual_clock)              # event 1 confirmed; delivery fails
+    assert repos.events.count() == 1
+    assert disp.calls and repos.alerts.count(success=True) == 0  # nothing delivered
+
+    # Resolve event 1.
+    await mgr.observe(False, 0.0)
+    manual_clock.advance(3.1)
+    await mgr.observe(False, 0.0)  # RESOLVED
+    await mgr.observe(False, 0.0)  # NORMAL
+
+    # Second real fall only seconds later (well within the 30s cooldown).
+    await drive_confirm(mgr, manual_clock)
+    assert repos.events.count() == 2
+    # Crucially, the second event DID attempt an alert (2 attempts total), proving
+    # the missed first alert did not suppress it.
+    assert len(disp.calls) == 2
+    assert repos.alerts.count() == 2
+
+
 @pytest.mark.asyncio
 async def test_reset_clears_state(repos, manual_clock):
     mgr, _ = build_manager(repos, manual_clock)

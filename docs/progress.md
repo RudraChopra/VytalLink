@@ -76,7 +76,12 @@ for the final summary.
   - Commit: `Prepare Jetson hardware integration and pilot documentation`
 
 ## Test status
-- Full suite green: **97 passed** (final). diagnose: no FAIL. smoke: 21/21 PASS.
+- Full suite green: **103 passed** (final). diagnose: no FAIL. smoke: 21/21 PASS.
+
+## Post-build adversarial review (multi-agent)
+- 5-dimension review + independent verification: 17 findings, 6 confirmed, all
+  6 fixed with tests. Notable: HIGH-severity cooldown-on-delivery safety fix
+  (a failed alert no longer suppresses the next real fall). See morning_report §17.
 
 ## Acceptance criteria (non-hardware) — all met
 setup ✅ · diagnose ✅ · app starts ✅ · dashboard ✅ · SQLite events/alerts/

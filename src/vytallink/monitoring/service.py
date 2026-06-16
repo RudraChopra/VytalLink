@@ -256,7 +256,11 @@ class MonitoringService:
         self._detect_once()
 
     async def _detect_and_observe_once(self) -> None:
-        evidence, confidence = self._detect_once()
+        # Camera read + model inference are blocking native calls (cv2 / torch).
+        # Offload them to a worker thread so a slow/bad RTSP source can never
+        # freeze the event loop (and thus the API). The DB is lock-guarded and
+        # safe to touch from the worker thread. observe() stays on the loop.
+        evidence, confidence = await asyncio.to_thread(self._detect_once)
         await self.event_manager.observe(evidence, confidence)
 
     # -- simulation controls (deterministic, real pipeline) ----------------

@@ -22,16 +22,31 @@ def sanitize_url(url: str | None) -> str:
     ``rtsp://alice:s3cret@cam.local:554/stream`` ->
     ``rtsp://***REDACTED***@cam.local:554/stream``
 
-    Non-URL strings are returned unchanged (best-effort). Never raises.
+    Robust against passwords that contain ``@`` (uses the parsed host/port,
+    which split on the *last* ``@``, rather than string-splitting on the first)
+    and against scheme-less URLs (``user:pass@host/path``). Non-URL strings are
+    returned unchanged (best-effort). Never raises.
     """
     if not url:
         return ""
     try:
         parts = urlsplit(url)
         if parts.netloc and "@" in parts.netloc:
-            host = parts.netloc.split("@", 1)[1]
-            netloc = f"{_REDACTED}@{host}"
+            # parts.hostname/port use rpartition('@'), so a '@' in the password
+            # cannot leak the host. Rebuild the netloc from the parsed host.
+            host = parts.hostname or ""
+            if ":" in host:  # IPv6 literal
+                host = f"[{host}]"
+            port = f":{parts.port}" if parts.port else ""
+            netloc = f"{_REDACTED}@{host}{port}"
             return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        if not parts.netloc and "@" in url:
+            # Scheme-less authority, e.g. "user:p@ss@host:554/path" — urlsplit
+            # parsed the whole thing as a path. Redact the userinfo portion.
+            authority, sep, rest = url.partition("/")
+            if "@" in authority:
+                hostpart = authority.rpartition("@")[2]
+                return f"{_REDACTED}@{hostpart}{sep}{rest}"
         return url
     except Exception:  # pragma: no cover - defensive: never let logging crash
         # Fall back to a crude redaction if parsing fails.

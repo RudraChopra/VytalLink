@@ -76,7 +76,10 @@ Key guarantees (all unit-tested, sleep-free via `ManualClock`):
 - A **possible** blip that clears before the confirm window creates **no event**.
 - Exactly **one alert per confirmed event**; repeated evidence does not re-alert.
 - `ALERT_COOLDOWN_SECONDS` suppresses a *new* event's alert if it confirms too
-  soon after the previous alert; after cooldown, a new event alerts again.
+  soon after the previous **successfully delivered** alert; after cooldown, a
+  new event alerts again. The cooldown is armed by the EventManager only once a
+  provider actually delivers (`commit_alert`); a *failed* delivery does not arm
+  it, so a missed alert can never suppress the alert for the next real fall.
 - Events are persisted to the DB at **confirmation** (not while merely possible).
 
 ## 4. Database overview

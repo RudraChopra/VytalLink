@@ -79,6 +79,30 @@ def test_sanitize_url_without_credentials_unchanged():
     assert sanitize_url("") == ""
 
 
+def test_sanitize_url_password_containing_at_sign():
+    # A password containing '@' must not leak any part of itself.
+    out = sanitize_url("rtsp://alice:p@ss@cam.local:554/stream")
+    assert "p@ss" not in out
+    assert "ss@" not in out
+    assert "alice" not in out
+    assert "cam.local:554" in out
+    assert out == "rtsp://***REDACTED***@cam.local:554/stream"
+
+
+def test_sanitize_url_scheme_less_credentials():
+    out = sanitize_url("user:secretpw@host:554/path")
+    assert "secretpw" not in out
+    assert "user" not in out
+    assert "host:554" in out
+    assert out.startswith("***REDACTED***@")
+
+
+def test_sanitize_url_ipv6_host():
+    out = sanitize_url("rtsp://bob:pw@[2001:db8::1]:554/s")
+    assert "pw" not in out and "bob" not in out
+    assert "[2001:db8::1]:554" in out
+
+
 def test_sanitize_secret_and_mask():
     assert sanitize_secret("hunter2") == "***REDACTED***"
     assert sanitize_secret("") == ""

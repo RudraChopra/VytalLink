@@ -25,11 +25,21 @@ def make_sm(clock: ManualClock, **over) -> FallEventStateMachine:
     )
 
 
-def confirm(sm: FallEventStateMachine, clock: ManualClock, conf: float = 0.9):
-    """Drive the machine from NORMAL to CONFIRMED_FALL. Returns transitions."""
+def confirm(sm: FallEventStateMachine, clock: ManualClock, conf: float = 0.9, deliver: bool = True):
+    """Drive the machine from NORMAL to CONFIRMED_FALL. Returns transitions.
+
+    ``deliver`` simulates the EventManager's behavior: the cooldown is armed
+    (``commit_alert``) only when an alert is actually delivered. Pass
+    ``deliver=False`` to simulate a failed alert delivery.
+    """
     out = sm.observe(True, conf)  # -> POSSIBLE
     clock.advance(sm.confirm_seconds + 0.05)
     out += sm.observe(True, conf)  # -> CONFIRMED
+    if any(t.alert for t in out):
+        if deliver:
+            sm.commit_alert()
+        else:
+            sm.cancel_pending_alert()
     return out
 
 
@@ -168,6 +178,28 @@ def test_second_event_after_cooldown_alerts(manual_clock):
     manual_clock.advance(31.0)  # cooldown elapsed
     out2 = confirm(sm, manual_clock)
     assert sum(int(t.alert) for t in out2) == 1
+
+
+def test_failed_alert_delivery_does_not_arm_cooldown(manual_clock):
+    # Safety regression: if the first alert is NOT delivered, the cooldown must
+    # NOT be armed, so the next real fall (within the cooldown window) still alerts.
+    sm = make_sm(manual_clock, cooldown_seconds=30.0)
+    out1 = confirm(sm, manual_clock, deliver=False)  # alert requested, delivery failed
+    assert any(t.alert for t in out1)
+    _resolve_to_normal(sm, manual_clock)
+    # Only a few seconds have passed (< 30s cooldown), but the first alert was
+    # never delivered, so the second confirmed fall must still request an alert.
+    out2 = confirm(sm, manual_clock, deliver=False)
+    assert any(t.alert for t in out2), "a missed first alert must not suppress the next real fall"
+
+
+def test_delivered_alert_arms_cooldown(manual_clock):
+    # Counterpart: a *delivered* first alert DOES arm the cooldown.
+    sm = make_sm(manual_clock, cooldown_seconds=30.0)
+    confirm(sm, manual_clock, deliver=True)
+    _resolve_to_normal(sm, manual_clock)
+    out2 = confirm(sm, manual_clock, deliver=True)
+    assert all(not t.alert for t in out2)  # suppressed within cooldown
 
 
 def test_new_event_directly_from_resolved_on_evidence(manual_clock):

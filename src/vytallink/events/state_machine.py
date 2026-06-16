@@ -73,6 +73,9 @@ class FallEventStateMachine:
         self._state: FallState = FallState.NORMAL
         self._event: FallEvent | None = None
         self._last_alert_mono: float | None = None
+        # Candidate cooldown anchor for an alert that has been *requested* at
+        # confirmation but not yet *delivered*. Armed only via commit_alert().
+        self._pending_alert_mono: float | None = None
 
     # -- introspection -----------------------------------------------------
     @property
@@ -191,8 +194,11 @@ class FallEventStateMachine:
             ev.confirmed_time = now
             should_alert = self._cooldown_ok(mono)
             if should_alert:
-                self._last_alert_mono = mono
-                ev.alerted = True
+                # Record the candidate cooldown anchor but DO NOT arm it yet.
+                # The cooldown is armed only when the alert is actually delivered
+                # (the EventManager calls commit_alert on success). This prevents
+                # a failed first alert from silently suppressing the next real fall.
+                self._pending_alert_mono = mono
             return [
                 self._transition(
                     FallState.CONFIRMED_FALL,
@@ -266,6 +272,29 @@ class FallEventStateMachine:
         self._event = None
         return [self._transition(FallState.NORMAL, TransitionReason.READY_AFTER_RESOLVED, now)]
 
+    # -- alert delivery feedback ------------------------------------------
+    def commit_alert(self) -> None:
+        """Arm the alert cooldown — call only after an alert was *delivered*.
+
+        Sets ``_last_alert_mono`` to the confirmation-time monotonic value so
+        subsequent events are subject to the cooldown. No-op if no alert was
+        pending.
+        """
+        if self._pending_alert_mono is not None:
+            self._last_alert_mono = self._pending_alert_mono
+            self._pending_alert_mono = None
+            if self._event is not None:
+                self._event.alerted = True
+
+    def cancel_pending_alert(self) -> None:
+        """Discard a pending alert without arming the cooldown.
+
+        Call when alert delivery failed (or no provider delivered), so the next
+        confirmed fall can still alert — a missed notification must not suppress
+        the next real one.
+        """
+        self._pending_alert_mono = None
+
     # -- manual operations -------------------------------------------------
     def manual_resolve(self, *, now: datetime | None = None) -> list[Transition]:
         """Force the live event to RESOLVED (caregiver action)."""
@@ -286,6 +315,7 @@ class FallEventStateMachine:
         self._event = None
         self._state = FallState.NORMAL
         self._last_alert_mono = None
+        self._pending_alert_mono = None
         return [
             Transition(
                 timestamp=now,
