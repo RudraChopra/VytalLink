@@ -1,0 +1,38 @@
+# VytalLink systemd service TEMPLATE.
+#
+# This file is a template only — it is NOT installed or enabled by the build.
+# To install it later (after you have reviewed it):
+#
+#   sudo cp deploy/vytallink.service /etc/systemd/system/vytallink.service
+#   # edit paths/User below to match your install, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vytallink
+#   systemctl status vytallink
+#   journalctl -u vytallink -f
+#
+# Secrets belong in the project .env (referenced via EnvironmentFile), never in
+# this unit file and never in git.
+
+[Unit]
+Description=VytalLink Phase 1 monitoring service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rchopra
+WorkingDirectory=/home/rchopra/VytalLink
+EnvironmentFile=/home/rchopra/VytalLink/.env
+ExecStart=/home/rchopra/VytalLink/.venv/bin/python -m vytallink.app
+Restart=on-failure
+RestartSec=5
+# Graceful shutdown: uvicorn handles SIGTERM and runs the lifespan shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Light hardening (relax if it interferes with camera/GPU device access).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

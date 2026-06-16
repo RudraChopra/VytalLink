@@ -66,10 +66,26 @@ for the final summary.
     from `.env`. Verified start/stop lifecycle + duplicate guard live.
   - Tests: +2 diagnostics tests (90 total, all green).
   - Commit: `Validate complete simulated Phase 1 workflow`
-- [ ] **M8 — Hardware adapters + final docs + morning report**
+- [x] **M8 — Hardware adapters + final docs + morning report**
+  - Dormant RTSP/file/YOLO adapters verified for safe failure (credential
+    redaction, missing-file/model clear errors, TensorRT deferred) — 7 tests.
+  - systemd template (`deploy/vytallink.service`, not installed). Full docs:
+    README, architecture (mermaid + state diagram), pilot_checklist,
+    hardware_needed, morning_report.
+  - Final: 97 tests pass, diagnose no-FAIL, smoke 21/21 PASS.
+  - Commit: `Prepare Jetson hardware integration and pilot documentation`
 
 ## Test status
-- Full suite green: **45 passed** (as of M3).
+- Full suite green: **97 passed** (final). diagnose: no FAIL. smoke: 21/21 PASS.
+
+## Acceptance criteria (non-hardware) — all met
+setup ✅ · diagnose ✅ · app starts ✅ · dashboard ✅ · SQLite events/alerts/
+devices/vitals ✅ · vitals update ✅ · one fall→one event ✅ · one alert ✅ ·
+duplicate suppression ✅ · labeling ✅ · resolution ✅ · API validation ✅ ·
+tests pass ✅ · smoke pass ✅ · clean shutdown ✅ · restart+persistence ✅ ·
+log rotation configured ✅ · no secrets committed ✅ · docs match behavior ✅ ·
+clean tree at final commit ✅ · morning report complete ✅. Hardware checks
+marked **pending** (not falsely passed).
 
 ## Key decisions
 - `--system-site-packages` venv (keeps Jetson cv2/torch/tensorrt); FastAPI.
