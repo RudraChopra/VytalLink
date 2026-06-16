@@ -60,6 +60,23 @@ def test_health_has_all_required_fields(client):
     assert "password" not in r.text.lower()
 
 
+def test_overall_health_degrades_when_detector_degraded(client):
+    """Regression: a degraded detector must surface in overall health (it was
+    previously ignored, so a failing model still read overall=ok)."""
+    svc = client._service
+    assert client.get("/health").json()["overall"] == "ok"
+    svc.simulation_mode = False  # exercise the live-mode escalation path
+    svc.detector.health = lambda: {"status": "degraded", "name": "yolo", "loaded": True}
+    assert client.get("/health").json()["overall"] == "degraded"
+
+
+def test_overall_health_down_when_detector_down_in_live(client):
+    svc = client._service
+    svc.simulation_mode = False
+    svc.detector.health = lambda: {"status": "down", "name": "yolo", "loaded": False}
+    assert client.get("/health").json()["overall"] == "down"
+
+
 def test_status_endpoint(client):
     r = client.get("/api/status")
     assert r.status_code == 200

@@ -54,10 +54,13 @@ function renderHealth(h) {
   $("s-uptime").textContent = fmtUptime(h.uptime_seconds);
   $("version").textContent = "v" + (h.version || "?");
 
-  // Simulation indicator.
+  // Simulation / live indicators.
   const sim = h.simulation && h.simulation.active;
   $("sim-indicator").hidden = !sim;
+  $("live-indicator").hidden = sim;
   $("vitals-sim").hidden = !sim;
+
+  renderHardware(h);
 
   // Warnings.
   const warnings = [];
@@ -71,6 +74,31 @@ function renderHealth(h) {
   // Dev controls visibility.
   CONTROLS_ENABLED = !!(h.simulation && h.simulation.controls_enabled);
   $("dev-controls").hidden = !CONTROLS_ENABLED;
+}
+
+function renderHardware(h) {
+  const cam = h.camera || {};
+  const det = h.detector || {};
+  const gpu = h.gpu || {};
+  const sim = !!(h.simulation && h.simulation.active);
+  const mode = $("hw-mode");
+  mode.textContent = sim ? "simulation" : (h.mode || "live");
+  mode.className = "tag " + (sim ? "" : "tag-live");
+  // Never show credentials or a model path — camera_name is already sanitized.
+  $("hw-camera").textContent = h.camera_name || cam.description || "—";
+  $("hw-camera-status").innerHTML = chip(cam.status);
+  $("hw-camera-fps").textContent = cam.effective_fps != null ? cam.effective_fps : "—";
+  $("hw-resolution").textContent = cam.resolution ? cam.resolution.join("×") : "—";
+  $("hw-reconnects").textContent = cam.reconnects != null ? cam.reconnects : "—";
+  $("hw-dropped").textContent = cam.frames_dropped != null ? cam.frames_dropped : "—";
+  $("hw-device").textContent = det.device || (sim ? "n/a (sim)" : "—");
+  $("hw-inf-fps").textContent = det.inference_fps != null ? det.inference_fps : "—";
+  $("hw-inf-ms").textContent = det.avg_inference_ms != null ? det.avg_inference_ms + " ms" : "—";
+  $("hw-gpu").textContent = gpu.available
+    ? (gpu.device_name || "available") + (gpu.compute_capability ? " (sm" + gpu.compute_capability + ")" : "")
+    : "unavailable";
+  $("hw-last-frame").textContent = fmtTime(h.latest_frame_time);
+  $("hw-last-inf").textContent = fmtTime(h.latest_inference_time);
 }
 
 function renderStatus(s) {

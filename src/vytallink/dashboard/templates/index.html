@@ -18,6 +18,7 @@
     </div>
     <div class="topbar-right">
       <span id="sim-indicator" class="pill pill-sim" hidden>SIMULATION</span>
+      <span id="live-indicator" class="pill pill-live" hidden>LIVE</span>
       <span id="overall-badge" class="badge badge-unknown">…</span>
     </div>
   </header>
@@ -46,6 +47,25 @@
         <div class="stat"><span class="label">Uptime</span><span id="s-uptime" class="value">—</span></div>
       </div>
       <div id="warnings" class="warnings"></div>
+    </section>
+
+    <!-- Hardware (camera + detector + GPU) -->
+    <section class="card" id="hardware-card">
+      <h2>Hardware <span id="hw-mode" class="tag">—</span></h2>
+      <div class="grid">
+        <div class="stat"><span class="label">Camera</span><span id="hw-camera" class="value value-sm">—</span></div>
+        <div class="stat"><span class="label">Camera status</span><span id="hw-camera-status" class="value">—</span></div>
+        <div class="stat"><span class="label">Camera FPS</span><span id="hw-camera-fps" class="value">—</span></div>
+        <div class="stat"><span class="label">Resolution</span><span id="hw-resolution" class="value">—</span></div>
+        <div class="stat"><span class="label">Reconnects</span><span id="hw-reconnects" class="value">—</span></div>
+        <div class="stat"><span class="label">Dropped frames</span><span id="hw-dropped" class="value">—</span></div>
+        <div class="stat"><span class="label">Detector device</span><span id="hw-device" class="value">—</span></div>
+        <div class="stat"><span class="label">Inference FPS</span><span id="hw-inf-fps" class="value">—</span></div>
+        <div class="stat"><span class="label">Inference latency</span><span id="hw-inf-ms" class="value">—</span></div>
+        <div class="stat"><span class="label">GPU</span><span id="hw-gpu" class="value value-sm">—</span></div>
+        <div class="stat"><span class="label">Last frame</span><span id="hw-last-frame" class="value value-sm">—</span></div>
+        <div class="stat"><span class="label">Last inference</span><span id="hw-last-inf" class="value value-sm">—</span></div>
+      </div>
     </section>
 
     <!-- Vitals -->
