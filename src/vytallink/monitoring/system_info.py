@@ -45,8 +45,14 @@ def gpu_info() -> dict[str, Any]:
                 else "torch present but CUDA unavailable (CPU-only build)"
             ),
         )
-        if available:  # pragma: no cover - no CUDA torch in Phase 1 env
+        if available:
             info["device_count"] = torch.cuda.device_count()
+            try:
+                info["device_name"] = torch.cuda.get_device_name(0)
+                cap = torch.cuda.get_device_capability(0)
+                info["compute_capability"] = f"{cap[0]}.{cap[1]}"
+            except Exception:  # pragma: no cover - defensive
+                pass
     except Exception as exc:
         info["detail"] = f"torch not importable: {type(exc).__name__}"
     return info

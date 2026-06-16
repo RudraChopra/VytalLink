@@ -29,14 +29,20 @@ def build_camera(settings: Settings, clock: Clock | None = None) -> CameraProvid
     raise ValueError(f"Unknown vision mode: {settings.vision_mode}")  # pragma: no cover
 
 
-def build_detector(settings: Settings) -> FallDetector:
+def build_detector(settings: Settings, clock: Clock | None = None) -> FallDetector:
     """Construct the fall detector for the configured DETECTOR_MODE."""
     if settings.detector_mode == DetectorMode.SIMULATION:
         return SimulatedFallDetector()
     if settings.detector_mode == DetectorMode.YOLO:
         from vytallink.vision.detector_yolo import YoloFallDetector
 
-        return YoloFallDetector(settings.model_path, image_size=settings.image_size)
+        return YoloFallDetector(
+            settings.model_path,
+            image_size=settings.image_size,
+            confidence=settings.confidence_threshold,
+            require_transition=settings.require_fall_transition,
+            clock=clock,
+        )
     if settings.detector_mode == DetectorMode.TENSORRT:
         # TensorRT export/engine path is intentionally not implemented until the
         # real model loads and ordinary GPU inference is confirmed.
