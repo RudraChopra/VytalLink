@@ -52,7 +52,20 @@ for the final summary.
     (fall/normal/reset) shown only when controls_enabled. No live video.
   - Tests: 3 dashboard integration tests (88 total, all green).
   - Commit: `Add responsive caregiver dashboard`
-- [ ] **M7 — End-to-end validation + scripts**
+- [x] **M7 — End-to-end validation + scripts**
+  - Scripts: setup.sh (idempotent venv+deps+dirs+.env+db), diagnose.sh
+    (delegates to a tested `vytallink.diagnostics` module), start.sh (validate,
+    duplicate-launch guard, PID file, health wait, LAN address), stop.sh
+    (graceful, PID-scoped, no broad kill), reset_demo_data.sh (dev-DB-only,
+    refuses production/outside-tree), smoke_test.sh.
+  - smoke_test.sh: **21/21 PASS** — start, health, dashboard, API, vitals,
+    1 fall → 1 event + 1 alert, duplicate suppression, label, invalid-input
+    422, resolve, clean shutdown, persistence across restart, final shutdown.
+  - Fixed a real config bug: blank `VYTALLINK_DATABASE_PATH=` now falls back to
+    the default instead of resolving to `.`; `load_settings` isolates tests
+    from `.env`. Verified start/stop lifecycle + duplicate guard live.
+  - Tests: +2 diagnostics tests (90 total, all green).
+  - Commit: `Validate complete simulated Phase 1 workflow`
 - [ ] **M8 — Hardware adapters + final docs + morning report**
 
 ## Test status

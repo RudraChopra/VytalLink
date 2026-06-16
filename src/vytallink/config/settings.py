@@ -127,6 +127,21 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------------
     # Validators
     # ----------------------------------------------------------------------
+    @field_validator("database_path", "log_dir", "events_dir", "clips_dir", mode="before")
+    @classmethod
+    def _blank_path_default(cls, v: Any, info: Any) -> Any:
+        """A blank value in .env (e.g. ``VYTALLINK_DATABASE_PATH=``) means
+        'use the default', not 'use the empty path'."""
+        if v is None or str(v).strip() in ("", "."):
+            defaults = {
+                "database_path": PROJECT_ROOT / "data" / "database" / "vytallink.db",
+                "log_dir": PROJECT_ROOT / "logs",
+                "events_dir": PROJECT_ROOT / "data" / "events",
+                "clips_dir": PROJECT_ROOT / "data" / "clips",
+            }
+            return defaults[info.field_name]
+        return v
+
     @field_validator("log_level")
     @classmethod
     def _validate_log_level(cls, v: str) -> str:
@@ -305,9 +320,11 @@ def load_settings(**overrides: Any) -> Settings:
     """Build a fresh Settings instance, applying keyword overrides.
 
     Used by tests and the simulation harness to construct deterministic
-    configurations without touching the environment.
+    configurations. It deliberately does NOT read the on-disk ``.env`` file
+    (``_env_file=None``), so tests are isolated from a developer's local config.
+    The application singleton :func:`get_settings` DOES read ``.env``.
     """
-    return Settings(**overrides)
+    return Settings(_env_file=None, **overrides)
 
 
 def reset_settings_cache() -> None:
