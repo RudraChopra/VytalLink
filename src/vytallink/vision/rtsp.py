@@ -1,17 +1,27 @@
-"""RTSP camera provider (uses OpenCV/FFmpeg, imported lazily).
+"""RTSP camera provider with a latest-frame background grabber.
 
-The connection string may embed credentials (``rtsp://user:pass@host/...``).
-**Only the sanitized form is ever logged** — see :func:`sanitize_url`. A short
-open/read timeout is requested through FFmpeg options so a bad URL fails fast
-instead of blocking; the base class then applies bounded-backoff reconnection.
+Reproduces the legacy v1 ``FrameGrabber`` design: a daemon thread continuously
+drains the RTSP stream (``cv2.VideoCapture`` with ``BUFFERSIZE=1`` + FFmpeg TCP +
+a bounded open timeout) and keeps only the **newest** frame. Readers therefore
+always get the freshest frame and a slow consumer can never build a stale
+backlog — old frames are intentionally dropped (counted in ``frames_dropped``).
 
-This provider is implemented cleanly but stays dormant in Phase 1 until a real
-``CAMERA_SOURCE`` is supplied. We never guess or probe credentials.
+Thread safety / reconnection (hardened): each grabber is bound to a per-connection
+**generation** token and **owns its own capture object**. On reconnect the base
+class calls :meth:`close` → a new generation supersedes the old thread; the old
+thread can never write the new connection's frame state (generation-fenced under
+the lock) and releases its *own* capture when it exits — so a capture is never
+released out from under an in-flight ``read()`` (no use-after-free), and a frame
+from a torn-down stream can never be re-issued as fresh.
+
+Security: the connection string may embed credentials
+(``rtsp://user:pass@host/...``); **only the sanitized form is ever logged**.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 from vytallink.common.errors import CameraError
@@ -31,53 +41,204 @@ class RTSPCamera(CameraProvider):
         source_id: str = "camera-rtsp",
         *,
         open_timeout_us: int = 5_000_000,
+        grab: bool = True,
         **kw,
     ):
         super().__init__(source_id, **kw)
         self._conn = connection_string  # may contain credentials; never log raw
         self.open_timeout_us = open_timeout_us
+        self._use_grabber = grab
         self._cap: Any = None
 
+        # grabber state (guarded by _grab_lock)
+        self._grab_thread: threading.Thread | None = None
+        self._grab_stop = threading.Event()
+        self._grab_lock = threading.Lock()
+        self._grab_generation = 0  # bumped each (re)connect; fences old threads
+        self._latest: Any = None
+        self._latest_seq = 0
+        self._consumed_seq = 0
+        self._frames_grabbed = 0
+        self._frames_consumed = 0  # distinct latest frames delivered to a reader
+        self._last_grab_mono: float | None = None
+        self._grab_error: str | None = None
+        self._resolution: tuple[int, int] | None = None
+
+    # -- safe identifiers --------------------------------------------------
     @property
     def safe_source(self) -> str:
         return sanitize_url(self._conn)
 
-    def _open_source(self) -> None:
-        if not self._conn:
-            raise CameraError("RTSP connection string is empty")
+    # -- capture creation (overridable for tests) --------------------------
+    def _create_capture(self) -> Any:
         try:
             import cv2  # noqa: WPS433
-        except ImportError as exc:  # pragma: no cover
+        except ImportError as exc:  # pragma: no cover - cv2 present on Jetson
             raise CameraError(f"OpenCV (cv2) not available: {exc}") from exc
-
-        # Ask FFmpeg to use TCP and a bounded timeout so a bad URL fails fast.
+        # FFmpeg: TCP transport + bounded timeout so a bad URL fails fast.
         os.environ.setdefault(
             "OPENCV_FFMPEG_CAPTURE_OPTIONS",
             f"rtsp_transport;tcp|stimeout;{self.open_timeout_us}",
         )
-        log.info("Opening RTSP source %s", self.safe_source)
         cap = cv2.VideoCapture(self._conn, cv2.CAP_FFMPEG)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:  # pragma: no cover - property may be unsupported
             pass
-        if not cap.isOpened():
-            cap.release()
+        return cap
+
+    # -- lifecycle hooks ---------------------------------------------------
+    def _open_source(self) -> None:
+        if not self._conn:
+            raise CameraError("RTSP connection string is empty")
+        log.info("Opening RTSP source %s", self.safe_source)
+        cap = self._create_capture()
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
             raise CameraError(f"Could not open RTSP source {self.safe_source}")
+        # New connection: bump the generation, reset per-connection grab state,
+        # then publish the cap and start the grabber bound to this generation.
+        with self._grab_lock:
+            self._grab_generation += 1
+            self._latest = None
+            self._latest_seq = 0
+            self._consumed_seq = 0
+            self._last_grab_mono = None
+            self._grab_error = None
+        self._grab_stop.clear()
         self._cap = cap
+        self._start_grabber()
+
+    def _start_grabber(self) -> None:
+        """Start the background grabber thread (overridable in tests)."""
+        if not self._use_grabber:
+            return
+        cap = self._cap
+        gen = self._grab_generation
+        self._grab_thread = threading.Thread(
+            target=self._grab_loop, args=(cap, gen), name=f"rtsp-grab-{self.source_id}", daemon=True
+        )
+        self._grab_thread.start()
+
+    def _grab_once(self, cap: Any | None = None, gen: int | None = None) -> bool:
+        """Grab one frame into the latest-frame slot, fenced by ``gen``.
+
+        Writes to the shared latest-frame state ONLY while ``gen`` is still the
+        current generation, so a superseded (reconnecting) thread can never
+        corrupt the new connection's state. Factored out so the latest-frame
+        logic is unit-testable without a thread.
+        """
+        cap = self._cap if cap is None else cap
+        gen = self._grab_generation if gen is None else gen
+        if cap is None:
+            return False
+        try:
+            ok, frame = cap.read()
+        except Exception as exc:
+            with self._grab_lock:
+                if gen == self._grab_generation:
+                    self._grab_error = str(exc)
+            return False
+        if not ok or frame is None:
+            with self._grab_lock:
+                if gen == self._grab_generation:
+                    self._grab_error = "empty frame"
+            return False
+        with self._grab_lock:
+            if gen != self._grab_generation:
+                return False  # superseded by a reconnect — discard this frame
+            self._latest = frame
+            self._latest_seq += 1
+            self._frames_grabbed += 1
+            self._last_grab_mono = self.clock.monotonic()
+            if self._resolution is None:
+                try:
+                    h, w = frame.shape[:2]
+                    self._resolution = (int(w), int(h))
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        return True
+
+    def _grab_loop(self, cap: Any, gen: int) -> None:
+        # Bound to (cap, gen): exits as soon as it is superseded or stopped, and
+        # ALWAYS releases its OWN capture — never a capture owned by a newer
+        # connection. This is what makes reconnects free of use-after-free.
+        try:
+            while gen == self._grab_generation and not self._grab_stop.is_set():
+                if not self._grab_once(cap, gen):
+                    break
+        finally:
+            try:
+                cap.release()
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     def _read_frame(self) -> Any | None:
-        if self._cap is None:
+        if not self._use_grabber:
+            return self._grab_once_direct()
+
+        with self._grab_lock:
+            latest = self._latest
+            seq = self._latest_seq
+            last_grab = self._last_grab_mono
+            if latest is None:
+                return None
+            # Stale: grabber produced no new frame within the stale window.
+            if last_grab is not None and (self.clock.monotonic() - last_grab) > self.stale_timeout:
+                return None
+            # Count a consumption only when a genuinely NEW frame is delivered, so
+            # frames_dropped = grabbed - distinct_consumed stays correct even when
+            # a reader polls faster than the grabber (it just re-reads the latest).
+            if seq > self._consumed_seq:
+                self._consumed_seq = seq
+                self._frames_consumed += 1
+        return latest
+
+    def _grab_once_direct(self) -> Any | None:
+        cap = self._cap
+        if cap is None:
             return None
-        ok, frame = self._cap.read()
+        ok, frame = cap.read()
         if not ok or frame is None:
             return None
+        with self._grab_lock:
+            self._frames_grabbed += 1
+            self._frames_consumed += 1
+            self._last_grab_mono = self.clock.monotonic()
+            if self._resolution is None:
+                try:
+                    h, w = frame.shape[:2]
+                    self._resolution = (int(w), int(h))
+                except Exception:  # pragma: no cover
+                    pass
         return frame
 
     def _close_source(self) -> None:
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        # Supersede the current grabber: bump the generation (so any in-flight
+        # grab is discarded) and signal stop. We do NOT release the capture here —
+        # the grabber thread owns and releases its own capture when it exits, so a
+        # capture is never released while a read() is in flight.
+        self._grab_stop.set()
+        with self._grab_lock:
+            self._grab_generation += 1
+            self._latest = None
+            self._last_grab_mono = None
+        thread = self._grab_thread
+        cap = self._cap
+        self._cap = None
+        if self._use_grabber:
+            if thread is not None:
+                # Best-effort brief join for the clean case; the thread self-releases
+                # its capture regardless, and generation-fencing makes it harmless.
+                thread.join(timeout=1.0)
+                if not thread.is_alive():
+                    self._grab_thread = None
+        elif cap is not None:
+            try:
+                cap.release()
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     def _frame_dims(self, raw: Any) -> tuple[int, int, Any]:
         try:
@@ -85,3 +246,26 @@ class RTSPCamera(CameraProvider):
             return int(w), int(h), raw
         except Exception:  # pragma: no cover - defensive
             return (0, 0, raw)
+
+    # -- health ------------------------------------------------------------
+    @property
+    def frames_dropped(self) -> int:
+        return max(0, self._frames_grabbed - self._frames_consumed)
+
+    def health(self) -> dict[str, Any]:
+        h = super().health()
+        thread = self._grab_thread
+        h.update(
+            {
+                "safe_source": self.safe_source,
+                "resolution": list(self._resolution) if self._resolution else None,
+                "frames_grabbed": self._frames_grabbed,
+                "frames_consumed": self._frames_consumed,
+                "frames_dropped": self.frames_dropped,
+                # True only while the CURRENT grabber thread is running. A superseded
+                # thread (still unwinding a blocked read) is not counted here, but it
+                # is generation-fenced and self-releasing, so it cannot affect output.
+                "grabber_alive": bool(thread and thread.is_alive()),
+            }
+        )
+        return h

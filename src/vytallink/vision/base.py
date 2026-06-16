@@ -56,6 +56,7 @@ class CameraProvider(abc.ABC):
         self._consecutive_failures = 0
         self._next_retry_mono: float = 0.0
         self._last_error: str | None = None
+        self._open_count = 0  # successful opens; reconnects = open_count - 1
 
     # -- describe ----------------------------------------------------------
     #: A human-readable, credential-safe description of the source.
@@ -74,6 +75,7 @@ class CameraProvider(abc.ABC):
         try:
             self._open_source()
             self._opened = True
+            self._open_count += 1
             self._consecutive_failures = 0
             self._last_error = None
             log.info("Camera %s opened (%s)", self.source_id, self.description)
@@ -189,6 +191,7 @@ class CameraProvider(abc.ABC):
             "last_frame_age_seconds": last_age,
             "stale": self.is_stale(),
             "consecutive_failures": self._consecutive_failures,
+            "reconnects": max(0, self._open_count - 1),
             "last_error": self._last_error,
         }
 
