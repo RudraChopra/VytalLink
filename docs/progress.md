@@ -20,7 +20,16 @@ for the final summary.
     cooldown; exactly-one-alert; duplicate suppression; manual resolve/reset;
     EventManager (persistence + alert dispatch). Clock-injected, sleep-free tests.
   - Tests: state machine (16) + event manager (8). Commit: `Implement tested fall event state machine`
-- [ ] **M4 — Providers (camera, detector, wearable, alerts)**
+- [x] **M4 — Providers (camera, detector, wearable, alerts)**
+  - Camera: provider ABC (fps, stale detection, bounded-backoff reconnection),
+    simulated camera, file + RTSP adapters (lazy cv2, credential-safe).
+  - Detector: ABC + evidence mapping, simulated detector (scenarios/scripts),
+    dormant YOLO adapter (lazy, clear errors, no downloads).
+  - Wearable: ABC + deterministic simulated wearable (HR/motion/battery/conn).
+  - Alerts: console + signed webhook (HMAC) providers + dispatcher (records
+    every attempt, isolates provider exceptions).
+  - Tests: camera (6) + detector (6) + wearable (6) + alerts (7) = 25.
+  - Commit: `Add modular simulated monitoring providers`
 - [ ] **M5 — Backend API + health**
 - [ ] **M6 — Dashboard**
 - [ ] **M7 — End-to-end validation + scripts**
