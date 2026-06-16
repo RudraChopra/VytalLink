@@ -36,6 +36,7 @@ from vytallink.events import EventManager, FallEventStateMachine, FallState
 from vytallink.monitoring import system_info
 from vytallink.vision import build_camera, build_detector, detections_to_evidence
 from vytallink.vision.detector_simulated import Scenario, SimulatedFallDetector
+from vytallink.vision.evidence import FallEvidenceSmoother
 from vytallink.wearable import build_wearable
 
 log = get_logger("monitoring.service")
@@ -81,8 +82,15 @@ class MonitoringService:
             simulated=self.simulation_mode,
         )
         self.camera = build_camera(settings, clock=self.system_clock)
-        self.detector = build_detector(settings)
+        self.detector = build_detector(settings, clock=self.system_clock)
         self.wearable = build_wearable(settings, clock=self.system_clock)
+        # Live-only: bridge brief detection gaps. Simulation is deterministic and
+        # never drops frames, so it needs (and gets) no smoothing.
+        self._evidence_smoother = (
+            None
+            if self.simulation_mode
+            else FallEvidenceSmoother(settings.evidence_hold_seconds, clock=self.system_clock)
+        )
 
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -245,11 +253,22 @@ class MonitoringService:
             self._update_device(self.settings.camera_device_id, self.camera.status())
             return False, 0.0
         detections = self.detector.infer(frame)
-        self._last_inference_time = self.system_clock.now()
+        # Only advance the "last inference" timestamp on a successful inference, so
+        # a detector that fails every frame does not look alive on the dashboard.
+        if getattr(self.detector, "last_infer_ok", True):
+            self._last_inference_time = self.system_clock.now()
         self._update_device(self.settings.camera_device_id, self.camera.status(), seen=True)
-        return detections_to_evidence(
+        evidence, confidence = detections_to_evidence(
             detections, self.settings.fall_class_set, self.settings.confidence_threshold
         )
+        if self._evidence_smoother is not None:
+            fall_set = self.settings.fall_class_set
+            had_detection = bool(detections)
+            had_upright = any(d.class_name.lower() not in fall_set for d in detections)
+            evidence, confidence = self._evidence_smoother.update(
+                evidence, confidence, had_detection=had_detection, had_upright=had_upright
+            )
+        return evidence, confidence
 
     def _heartbeat_once(self) -> None:
         # Read + infer for liveness/health, but do NOT feed the state machine.
@@ -329,28 +348,39 @@ class MonitoringService:
         db_health = self.db.health()
         cam_health = self.camera.health()
         wear_health = self.wearable.health()
+        det_health = self._detector_health()
         disk = system_info.disk_info(self.settings.database_path, self.settings.disk_warning_percent)
         gpu = system_info.gpu_info()
 
         server_ok = self._running
+        live = not self.simulation_mode
+        det_status = det_health.get("status")
         overall = HealthStatus.OK
         if not db_health.get("ok") or not server_ok:
+            overall = HealthStatus.DOWN
+        elif live and det_status == HealthStatus.DOWN.value:
+            # In live mode a non-functional detector means no fall can be detected.
             overall = HealthStatus.DOWN
         elif (
             cam_health["status"] == HealthStatus.DOWN.value
             or wear_health["status"] == HealthStatus.DOWN.value
             or disk.get("warning")
+            or det_status == HealthStatus.DEGRADED.value
+            or (live and cam_health["status"] == HealthStatus.DEGRADED.value)
         ):
             overall = HealthStatus.DEGRADED
 
+        mode = "simulation" if self.simulation_mode else self.settings.vision_mode.value
         return {
             "overall": overall.value,
             "version": __version__,
             "phase": __phase__,
+            "mode": mode,
+            "camera_name": cam_health.get("safe_source") or cam_health.get("description"),
             "server": {"status": HealthStatus.OK.value if server_ok else HealthStatus.DOWN.value, "running": server_ok},
             "database": {"status": HealthStatus.OK.value if db_health.get("ok") else HealthStatus.DOWN.value, **db_health},
             "camera": cam_health,
-            "detector": self._detector_health(),
+            "detector": det_health,
             "wearable": wear_health,
             "alerts": self._alert_health(),
             "gpu": gpu,
