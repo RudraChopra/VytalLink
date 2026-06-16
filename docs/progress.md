@@ -30,7 +30,18 @@ for the final summary.
     every attempt, isolates provider exceptions).
   - Tests: camera (6) + detector (6) + wearable (6) + alerts (7) = 25.
   - Commit: `Add modular simulated monitoring providers`
-- [ ] **M5 — Backend API + health**
+- [x] **M5 — Backend API + health**
+  - MonitoringService orchestrates providers → event pipeline: simulation mode
+    drives the real pipeline deterministically (ManualClock) + health-only
+    heartbeat; live mode uses a real-time detection loop. Wearable loop in both.
+    Graceful start/stop, device registration, provider-exception isolation.
+  - system_info (CPU/mem/disk-warning/GPU). FastAPI app: /health, /api/status,
+    events (list/detail/label/resolve), devices, vitals (latest/list),
+    simulation controls (dev+sim only), JSON error handling (no stack traces).
+  - app.py entrypoint (uvicorn + graceful shutdown). Package installed editable.
+  - Verified live via uvicorn+curl: 1 fall → 1 event + 1 alert, vitals, SIGTERM.
+  - Tests: 15 API integration tests (85 total, all green).
+  - Commit: `Add VytalLink monitoring API`
 - [ ] **M6 — Dashboard**
 - [ ] **M7 — End-to-end validation + scripts**
 - [ ] **M8 — Hardware adapters + final docs + morning report**
