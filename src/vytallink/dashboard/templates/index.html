@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>VytalLink — Phase 1</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◑</span>
+      <div>
+        <h1>VytalLink</h1>
+        <span class="phase" id="phase">Phase 1</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="sim-indicator" class="pill pill-sim" hidden>SIMULATION</span>
+      <span id="overall-badge" class="badge badge-unknown">…</span>
+    </div>
+  </header>
+
+  <main>
+    <div id="conn-banner" class="banner banner-error" hidden>
+      Lost connection to VytalLink server — retrying…
+    </div>
+
+    <p class="disclaimer">
+      ⚠️ VytalLink is <strong>not</strong> a certified medical device, an
+      emergency service, or a replacement for human supervision.
+    </p>
+
+    <!-- System status -->
+    <section class="card">
+      <h2>System</h2>
+      <div class="grid">
+        <div class="stat"><span class="label">Overall</span><span id="s-overall" class="value">—</span></div>
+        <div class="stat"><span class="label">Fall state</span><span id="s-fall" class="value">—</span></div>
+        <div class="stat"><span class="label">Camera</span><span id="s-camera" class="value">—</span></div>
+        <div class="stat"><span class="label">Detector</span><span id="s-detector" class="value">—</span></div>
+        <div class="stat"><span class="label">Wearable</span><span id="s-wearable" class="value">—</span></div>
+        <div class="stat"><span class="label">GPU</span><span id="s-gpu" class="value">—</span></div>
+        <div class="stat"><span class="label">Database</span><span id="s-db" class="value">—</span></div>
+        <div class="stat"><span class="label">Uptime</span><span id="s-uptime" class="value">—</span></div>
+      </div>
+      <div id="warnings" class="warnings"></div>
+    </section>
+
+    <!-- Vitals -->
+    <section class="card">
+      <h2>Wearable vitals <span id="vitals-sim" class="tag" hidden>simulated</span></h2>
+      <div class="grid grid-vitals">
+        <div class="vital"><span class="vital-num" id="v-hr">—</span><span class="vital-unit">bpm</span><span class="label">Heart rate</span></div>
+        <div class="vital"><span class="vital-num" id="v-motion">—</span><span class="vital-unit">idx</span><span class="label">Motion</span></div>
+        <div class="vital"><span class="vital-num" id="v-battery">—</span><span class="vital-unit">%</span><span class="label">Battery</span></div>
+        <div class="vital"><span class="vital-num" id="v-conn">—</span><span class="vital-unit">%</span><span class="label">Link quality</span></div>
+      </div>
+    </section>
+
+    <!-- Dev controls -->
+    <section id="dev-controls" class="card card-dev" hidden>
+      <h2>Development controls <span class="tag tag-dev">dev only</span></h2>
+      <p class="muted">These drive the simulated pipeline. Disabled outside development.</p>
+      <div class="btn-row">
+        <button id="btn-fall" class="btn btn-danger">Simulate fall</button>
+        <button id="btn-normal" class="btn">Simulate normal</button>
+        <button id="btn-reset" class="btn btn-ghost">Reset</button>
+      </div>
+    </section>
+
+    <!-- Events -->
+    <section class="card">
+      <h2>Recent events <span id="events-count" class="tag">0</span></h2>
+      <div id="events-empty" class="muted">No events recorded yet.</div>
+      <div id="events-list" class="events"></div>
+    </section>
+
+    <!-- Devices -->
+    <section class="card">
+      <h2>Devices</h2>
+      <div id="devices-list" class="devices"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>VytalLink <span id="version">v?</span></span>
+    <span>Last update: <span id="last-update">—</span></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

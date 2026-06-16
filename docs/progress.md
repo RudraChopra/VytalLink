@@ -42,7 +42,16 @@ for the final summary.
   - Verified live via uvicorn+curl: 1 fall → 1 event + 1 alert, vitals, SIGTERM.
   - Tests: 15 API integration tests (85 total, all green).
   - Commit: `Add VytalLink monitoring API`
-- [ ] **M6 — Dashboard**
+- [x] **M6 — Dashboard**
+  - Responsive vanilla HTML/CSS/JS dashboard (no frameworks), mobile-friendly,
+    polls /health + /api/status + /api/events + /api/devices every 3s. Shows
+    overall health, fall state, camera/detector/wearable/GPU/DB status, vitals
+    (HR/motion/battery/link), recent events with confidence/label/alert status,
+    resolve + real-fall/false-alert actions, device warnings, simulation
+    indicator, last-update time, nonmedical disclaimer. Dev controls
+    (fall/normal/reset) shown only when controls_enabled. No live video.
+  - Tests: 3 dashboard integration tests (88 total, all green).
+  - Commit: `Add responsive caregiver dashboard`
 - [ ] **M7 — End-to-end validation + scripts**
 - [ ] **M8 — Hardware adapters + final docs + morning report**
 
