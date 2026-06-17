@@ -97,3 +97,6 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Soak / diagnostics output (metrics only — never images)
+/diagnostics/

@@ -76,6 +76,7 @@ class MonitoringService:
             cooldown_seconds=settings.alert_cooldown_seconds,
             source_device=settings.camera_device_id,
             clock=self.event_clock,
+            reconfirm_cooldown_seconds=settings.fall_reconfirm_cooldown_seconds,
         )
         self.event_manager = EventManager(
             self.repos,
@@ -395,7 +396,19 @@ class MonitoringService:
         for d in detections:
             name = d.class_name.lower()
             self._class_counts[name] = self._class_counts.get(name, 0) + 1
-            summary.append({"class": d.class_name, "confidence": round(d.confidence, 3)})
+            md = d.metadata or {}
+            summary.append({
+                "class": d.class_name,
+                "confidence": round(d.confidence, 3),
+                # Normalized geometry for false-positive analysis (no pixels).
+                "bbox_norm": md.get("bbox_norm"),
+                "area_frac": md.get("area_frac"),
+                "aspect": md.get("aspect"),
+                "vertical_center": md.get("vertical_center"),
+                "edges": md.get("edges"),
+                "rejection": md.get("rejection"),
+                "raw_class": md.get("raw_class"),
+            })
             if name in fall_set:
                 saw_fallen = True
         if saw_fallen:
@@ -709,12 +722,16 @@ class MonitoringService:
             "require_transition": self.settings.require_fall_transition,
             "fall_classes": sorted(self.settings.fall_class_set),
             "transitions": list(self._transitions),
+            "reconfirm_cooldown_seconds": self.settings.fall_reconfirm_cooldown_seconds,
+            "rejections": det.get("rejection_counts"),
             "detector": {
                 "device": det.get("device"),
                 "device_label": det.get("device_label"),
                 "inference_fps": det.get("inference_fps"),
                 "avg_inference_ms": det.get("avg_inference_ms"),
                 "inference_count": det.get("inference_count"),
+                "min_fallen_box_area_frac": det.get("min_fallen_box_area_frac"),
+                "reject_edge_clipped_fallen": det.get("reject_edge_clipped_fallen"),
             },
             "camera": {
                 "effective_fps": cam.get("effective_fps"),

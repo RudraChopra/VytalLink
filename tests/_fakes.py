@@ -55,7 +55,16 @@ class FakeYoloModel:
             self._idx += 1
         else:
             spec = []
-        boxes = [_Box(c, cf) for (c, cf) in spec]
+        # Each script item is (class_id, confidence) or (class_id, confidence, xyxy)
+        # so tests can place a box at a specific normalized location.
+        boxes = []
+        for item in spec:
+            if len(item) == 3:
+                c, cf, xyxy = item
+                boxes.append(_Box(c, cf, xyxy))
+            else:
+                c, cf = item
+                boxes.append(_Box(c, cf))
         return [_Result(self.names, boxes)]
 
 

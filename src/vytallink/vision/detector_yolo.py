@@ -60,6 +60,9 @@ class YoloFallDetector(FallDetector):
         gate_config: GateConfig | None = None,
         clock: Clock | None = None,
         warmup: bool = True,
+        min_fallen_box_area_frac: float = 0.0,
+        reject_edge_clipped_fallen: bool = False,
+        edge_margin_frac: float = 0.02,
     ) -> None:
         self.model_path = model_path
         self.image_size = int(image_size)
@@ -70,6 +73,14 @@ class YoloFallDetector(FallDetector):
         self.clock: Clock = clock or SystemClock()
         self._warmup = warmup
         self._gate = PostureTransitionGate(gate_config, clock=self.clock)
+        # Conservative false-positive box gates (0 / False => disabled). A fallen
+        # box that is too small or clipped at a non-floor frame edge is recorded
+        # for visibility but does NOT count as fall evidence.
+        self.min_fallen_box_area_frac = float(min_fallen_box_area_frac)
+        self.reject_edge_clipped_fallen = bool(reject_edge_clipped_fallen)
+        self.edge_margin_frac = float(edge_margin_frac)
+        #: Cumulative count of fallen boxes downgraded by each reason (debug).
+        self.rejection_counts: dict[str, int] = {}
 
         self._model: Any = None
         self.device_str: str = "cpu"
@@ -252,7 +263,19 @@ class YoloFallDetector(FallDetector):
         self._last_error = None
 
         raw_boxes = self._extract_boxes(results)
-        best_fallen, best_upright, has_det = self._summarize(raw_boxes)
+        # Annotate each box with normalized geometry and (for fallen boxes) any
+        # conservative rejection reason; only UNREJECTED fallen boxes count toward
+        # the fall confidence the gate/threshold see.
+        annotated = self._annotate_boxes(raw_boxes, frame.width or 0, frame.height or 0)
+        best_fallen = max(
+            (a["conf"] for a in annotated if a["name"] == "fallen" and a["rejection"] is None),
+            default=0.0,
+        )
+        best_upright = max(
+            (a["conf"] for a in annotated if a["name"] in ("sitting", "standing")),
+            default=0.0,
+        )
+        has_det = bool(annotated)
 
         # Gate decides whether a fallen posture is a genuine fall *event*.
         if self.require_transition:
@@ -264,7 +287,59 @@ class YoloFallDetector(FallDetector):
         else:
             fall_is_event = best_fallen >= self.confidence
 
-        return self._build_detections(frame, raw_boxes, fall_is_event)
+        return self._build_detections(frame, annotated, fall_is_event)
+
+    def _box_geometry(self, bbox: tuple[float, float, float, float], w: int, h: int) -> dict[str, Any]:
+        """Normalized geometry for analysis: bbox_norm, area_frac, aspect,
+        vertical_center, and which frame edges the box is clipped against."""
+        x1, y1, x2, y2 = bbox
+        if w <= 0 or h <= 0:
+            return {"bbox_norm": None, "area_frac": None, "aspect": None,
+                    "vertical_center": None, "edges": []}
+        nx1, ny1, nx2, ny2 = x1 / w, y1 / h, x2 / w, y2 / h
+        bw, bh = max(0.0, nx2 - nx1), max(0.0, ny2 - ny1)
+        m = self.edge_margin_frac
+        edges = []
+        if nx1 <= m:
+            edges.append("left")
+        if nx2 >= 1.0 - m:
+            edges.append("right")
+        if ny1 <= m:
+            edges.append("top")
+        if ny2 >= 1.0 - m:
+            edges.append("bottom")
+        return {
+            "bbox_norm": [round(nx1, 4), round(ny1, 4), round(nx2, 4), round(ny2, 4)],
+            "area_frac": round(bw * bh, 5),
+            "aspect": round(bw / bh, 3) if bh > 0 else None,
+            "vertical_center": round((ny1 + ny2) / 2, 4),
+            "edges": edges,
+        }
+
+    def _fallen_rejection(self, geom: dict[str, Any]) -> str | None:
+        """Conservative reason this fallen box should NOT count as fall evidence,
+        or None. Bottom-edge clipping is allowed (real falls land low)."""
+        area = geom.get("area_frac")
+        if self.min_fallen_box_area_frac > 0 and area is not None and area < self.min_fallen_box_area_frac:
+            return "too_small"
+        if self.reject_edge_clipped_fallen:
+            # Only non-floor edges indicate a partial person entering/leaving the
+            # frame; a fallen person legitimately touches the bottom edge.
+            bad = [e for e in geom.get("edges", []) if e in ("left", "right", "top")]
+            if bad:
+                return "edge_clipped_" + "".join(sorted(e[0] for e in bad))
+        return None
+
+    def _annotate_boxes(self, raw_boxes, w: int, h: int) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for cls_id, name, conf, bbox in raw_boxes:
+            geom = self._box_geometry(bbox, w, h)
+            rejection = self._fallen_rejection(geom) if name == "fallen" else None
+            if rejection is not None:
+                self.rejection_counts[rejection] = self.rejection_counts.get(rejection, 0) + 1
+            out.append({"cls_id": cls_id, "name": name, "conf": conf, "bbox": bbox,
+                        "geom": geom, "rejection": rejection})
+        return out
 
     def _extract_boxes(self, results: Any) -> list[tuple[int, str, float, tuple[float, float, float, float]]]:
         out: list[tuple[int, str, float, tuple[float, float, float, float]]] = []
@@ -281,30 +356,27 @@ class YoloFallDetector(FallDetector):
                 out.append((cls_id, name, conf, (xyxy[0], xyxy[1], xyxy[2], xyxy[3])))
         return out
 
-    @staticmethod
-    def _summarize(boxes: list[tuple[int, str, float, tuple]]) -> tuple[float, float, bool]:
-        best_fallen = 0.0
-        best_upright = 0.0
-        for _cls, name, conf, _bbox in boxes:
-            if name == "fallen":
-                best_fallen = max(best_fallen, conf)
-            elif name in ("sitting", "standing"):
-                best_upright = max(best_upright, conf)
-        return best_fallen, best_upright, bool(boxes)
-
     def _build_detections(
         self,
         frame: Frame,
-        boxes: list[tuple[int, str, float, tuple]],
+        annotated: list[dict[str, Any]],
         fall_is_event: bool,
     ) -> list[RawDetection]:
         detections: list[RawDetection] = []
-        for cls_id, name, conf, bbox in boxes:
+        for a in annotated:
+            name, cls_id, conf, bbox = a["name"], a["cls_id"], a["conf"], a["bbox"]
+            rejection, geom = a["rejection"], a["geom"]
             class_name = name
-            if name == "fallen" and self.require_transition and not fall_is_event:
-                # A fallen posture that is not (yet) a confirmed transition.
-                # Surfaced for visibility but NOT as fall evidence.
+            # A fallen box is surfaced as the non-evidence ``fallen_posture`` class
+            # when a conservative box gate rejected it, OR (transition gate on) when
+            # it is not part of a confirmed upright→fallen transition.
+            if name == "fallen" and (
+                rejection is not None or (self.require_transition and not fall_is_event)
+            ):
                 class_name = FALLEN_POSTURE_CLASS
+            metadata: dict[str, Any] = {"simulated": False, "raw_class": name, **geom}
+            if rejection is not None:
+                metadata["rejection"] = rejection
             detections.append(
                 RawDetection(
                     timestamp=frame.timestamp,
@@ -314,7 +386,7 @@ class YoloFallDetector(FallDetector):
                     bbox=bbox,
                     source_id=frame.source_id,
                     frame_id=frame.frame_id,
-                    metadata={"simulated": False, "raw_class": name},
+                    metadata=metadata,
                 )
             )
         return detections
@@ -373,6 +445,9 @@ class YoloFallDetector(FallDetector):
             "image_size": self.image_size,
             "confidence_threshold": self.confidence,
             "require_transition": self.require_transition,
+            "min_fallen_box_area_frac": self.min_fallen_box_area_frac,
+            "reject_edge_clipped_fallen": self.reject_edge_clipped_fallen,
+            "rejection_counts": dict(self.rejection_counts),
             "warmup_ms": round(self.warmup_ms, 1) if self.warmup_ms is not None else None,
             "last_inference_ms": self.last_inference_ms,
             "avg_inference_ms": round(self.avg_inference_ms, 2) if self.avg_inference_ms is not None else None,

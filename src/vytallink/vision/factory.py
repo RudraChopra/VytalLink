@@ -51,6 +51,9 @@ def build_detector(settings: Settings, clock: Clock | None = None) -> FallDetect
             image_size=settings.image_size,
             confidence=settings.confidence_threshold,
             require_transition=settings.require_fall_transition,
+            min_fallen_box_area_frac=settings.detector_min_fallen_box_area_frac,
+            reject_edge_clipped_fallen=settings.detector_reject_edge_clipped_fallen,
+            edge_margin_frac=settings.detector_edge_margin_frac,
             clock=clock,
         )
     if settings.detector_mode == DetectorMode.TENSORRT:

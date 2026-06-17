@@ -62,10 +62,15 @@ class FallEventStateMachine:
         source_device: str = "camera-1",
         clock: Clock | None = None,
         uid_factory: Callable[[], str] | None = None,
+        reconfirm_cooldown_seconds: float = 0.0,
     ) -> None:
         self.confirm_seconds = float(confirm_seconds)
         self.clear_seconds = float(clear_seconds)
         self.cooldown_seconds = float(cooldown_seconds)
+        # De-dup window: suppress a NEW confirmation for this long after the last
+        # one so a single continuous (flickering) low posture yields one event.
+        self.reconfirm_cooldown_seconds = float(reconfirm_cooldown_seconds)
+        self._last_confirm_mono: float | None = None
         self.source_device = source_device
         self.clock: Clock = clock or SystemClock()
         self._uid_factory = uid_factory or _default_uid_factory
@@ -191,7 +196,18 @@ class FallEventStateMachine:
         ev.detection_count += 1
         ev.highest_confidence = max(ev.highest_confidence, confidence)
         if (mono - ev.possible_since) >= self.confirm_seconds:
+            # De-dup: within the reconfirm window after a prior confirmation, do
+            # NOT confirm a new event — one continuous (flickering) low posture
+            # must not spawn repeated events. Stay POSSIBLE; it dismisses to NORMAL
+            # when evidence clears, and a genuine fall after the window confirms.
+            if (
+                self.reconfirm_cooldown_seconds > 0
+                and self._last_confirm_mono is not None
+                and (mono - self._last_confirm_mono) < self.reconfirm_cooldown_seconds
+            ):
+                return []
             ev.confirmed_time = now
+            self._last_confirm_mono = mono
             should_alert = self._cooldown_ok(mono)
             if should_alert:
                 # Record the candidate cooldown anchor but DO NOT arm it yet.
@@ -316,6 +332,7 @@ class FallEventStateMachine:
         self._state = FallState.NORMAL
         self._last_alert_mono = None
         self._pending_alert_mono = None
+        self._last_confirm_mono = None
         return [
             Transition(
                 timestamp=now,

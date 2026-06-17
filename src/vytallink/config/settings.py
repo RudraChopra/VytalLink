@@ -116,11 +116,30 @@ class Settings(BaseSettings):
     require_fall_transition: bool = Field(
         default=False, validation_alias="DETECTOR_REQUIRE_TRANSITION"
     )
+    # Conservative false-positive box gates (0 / false => disabled). A ``fallen``
+    # box smaller than this fraction of the frame, or clipped at a non-floor frame
+    # edge (partial person), is recorded but does NOT count as fall evidence.
+    detector_min_fallen_box_area_frac: float = Field(
+        default=0.0, validation_alias="DETECTOR_MIN_FALLEN_BOX_AREA_FRAC"
+    )
+    detector_reject_edge_clipped_fallen: bool = Field(
+        default=False, validation_alias="DETECTOR_REJECT_EDGE_CLIPPED_FALLEN"
+    )
+    detector_edge_margin_frac: float = Field(
+        default=0.02, validation_alias="DETECTOR_EDGE_MARGIN_FRAC"
+    )
 
     # ---- Fall event state machine ----------------------------------------
     fall_confirm_seconds: float = Field(default=2.0, validation_alias="FALL_CONFIRM_SECONDS")
     fall_clear_seconds: float = Field(default=3.0, validation_alias="FALL_CLEAR_SECONDS")
     alert_cooldown_seconds: float = Field(default=30.0, validation_alias="ALERT_COOLDOWN_SECONDS")
+    # De-dup: after a confirmed event, suppress a NEW confirmation for this long so
+    # one continuous (possibly flickering) low posture cannot spawn repeated
+    # events. 0 disables. A genuine independent fall after the window still
+    # confirms. Recommended with DETECTOR_REQUIRE_TRANSITION for live use.
+    fall_reconfirm_cooldown_seconds: float = Field(
+        default=0.0, validation_alias="FALL_RECONFIRM_COOLDOWN_SECONDS"
+    )
     # Live only: bridge brief real-world detection gaps so a sustained fall reads
     # as continuous evidence. Kept below FALL_CLEAR_SECONDS so recovery still works.
     evidence_hold_seconds: float = Field(default=1.0, validation_alias="EVIDENCE_HOLD_SECONDS")
