@@ -30,6 +30,11 @@ def _settings(tmp_path: Path, **over):
         wearable_sample_seconds=0.5,
         fall_confirm_seconds=2.0,
         fall_clear_seconds=3.0,
+        # Keep overall-health assertions independent of the host's real disk
+        # fill (a dev machine with a >90%-full disk would otherwise degrade
+        # overall health). Production keeps the 90% default; a dedicated disk
+        # test can lower this to exercise the warning path.
+        disk_warning_percent=100.0,
     )
     base.update(over)
     return load_settings(**base)
@@ -68,6 +73,20 @@ def test_overall_health_degrades_when_detector_degraded(client):
     svc.simulation_mode = False  # exercise the live-mode escalation path
     svc.detector.health = lambda: {"status": "degraded", "name": "yolo", "loaded": True}
     assert client.get("/health").json()["overall"] == "degraded"
+
+
+def test_healthy_simulation_reports_overall_ok(client):
+    """Regression: a freshly started simulation (no live video, no real camera
+    frames) is fully healthy. The simulated camera must not drag overall health
+    to degraded just because frame_count == 0 / it has no pixel data."""
+    h = client.get("/health").json()
+    assert h["overall"] == "ok"
+    cam = h["camera"]
+    assert cam["status"] == "ok"
+    assert cam["stale"] is False
+    assert cam["frame_count"] == 0
+    assert cam["simulated"] is True
+    assert cam["live_video_available"] is False
 
 
 def test_overall_health_down_when_detector_down_in_live(client):
@@ -161,6 +180,23 @@ def test_video_token_and_credentials_never_in_health(token_client):
         assert secret not in blob
     # video_protected flag present (bool), token absent
     assert token_client.get("/health").json()["video_protected"] is True
+
+
+def test_health_status_never_expose_home_dir_or_username(client):
+    """Regression: public health/status responses must never leak the local
+    username or an absolute home-directory path (the DB lived under
+    /Users/<username>/... and was surfaced verbatim). The database is reported
+    by filename only."""
+    import getpass
+
+    blob = client.get("/health").text + client.get("/api/status").text
+    assert getpass.getuser() not in blob
+    assert str(Path.home()) not in blob
+    # The DB is still identified, but by basename only — no directory.
+    db = client.get("/health").json()["database"]
+    assert db["name"] == "api_test.db"
+    assert "/" not in db["name"]
+    assert "path" not in db  # absolute path no longer exposed
 
 
 def test_status_endpoint(client):

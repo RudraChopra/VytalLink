@@ -8,6 +8,7 @@ they are logged or surfaced.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 # Matches ``scheme://user:pass@host`` and similar credential-in-netloc forms.
@@ -51,6 +52,23 @@ def sanitize_url(url: str | None) -> str:
     except Exception:  # pragma: no cover - defensive: never let logging crash
         # Fall back to a crude redaction if parsing fails.
         return _CREDENTIAL_NETLOC.sub(f"{_REDACTED}@", url)
+
+
+def safe_path(path: str | Path | None) -> str:
+    """Reduce a filesystem path to a credential-safe identifier.
+
+    Absolute paths frequently embed the local username (``/Users/alice/...``)
+    and other host details that must never appear in public API responses or
+    logs. We surface only the *basename* — enough to identify the file
+    (``api_test.db``, ``vytallink.db``) without leaking the home directory or
+    user. The in-memory sentinel and empty values pass through unchanged.
+    """
+    if not path:
+        return ""
+    text = str(path)
+    if text == ":memory:":
+        return text
+    return Path(text).name or text
 
 
 def sanitize_secret(value: str | None) -> str:

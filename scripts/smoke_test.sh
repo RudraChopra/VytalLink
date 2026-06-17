@@ -43,10 +43,13 @@ cleanup() {
 trap cleanup EXIT
 
 start_app() {
+  # DISK_WARNING_PERCENT is raised so the smoke test validates the app pipeline
+  # rather than the host's disk fill: a dev machine with a >90%-full disk would
+  # otherwise report overall=degraded. Production keeps the 90% default.
   VYTALLINK_ENV=development VISION_MODE=simulation DETECTOR_MODE=simulation \
   WEARABLE_MODE=simulation VYTALLINK_PORT="$PORT" \
   VYTALLINK_DATABASE_PATH="$SMOKE_DB" VYTALLINK_LOG_DIR="$ROOT/logs" \
-  WEARABLE_SAMPLE_SECONDS=1.0 \
+  WEARABLE_SAMPLE_SECONDS=1.0 DISK_WARNING_PERCENT=100.0 \
     nohup "$PY" -m vytallink.app >>"$SMOKE_LOG" 2>&1 &
   APP_PID=$!
 }

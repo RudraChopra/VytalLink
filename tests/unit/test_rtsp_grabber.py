@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from vytallink.common.clock import ManualClock
+from vytallink.common.types import HealthStatus
 from vytallink.vision.rtsp import RTSPCamera
 from tests._fakes import FakeCapture
 
@@ -68,6 +69,33 @@ def test_stale_returns_none_for_reconnect():
     assert cam._read_frame() is not None
     clock.advance(3.0)  # > stale_timeout (2.0) with no new grab
     assert cam._read_frame() is None
+    cam.close()
+
+
+def test_rtsp_opened_without_frames_is_degraded():
+    """Unlike the simulated camera, a real RTSP camera that opens but never
+    delivers a frame is a genuine problem and must report degraded."""
+    clock = ManualClock()
+    cam = _TestRTSP([_frame(1)], clock)
+    cam.open()
+    assert cam.frame_count == 0
+    assert cam.is_stale() is True
+    assert cam.status() is HealthStatus.DEGRADED
+    cam.close()
+
+
+def test_rtsp_goes_degraded_when_stale():
+    """A real RTSP camera that stops delivering frames (frame age exceeds the
+    stale timeout) must report degraded so caregivers know the feed is down."""
+    clock = ManualClock()
+    cam = _TestRTSP([_frame(1)], clock)
+    cam.open()
+    cam._grab_once()
+    assert cam.read() is not None  # public read records the last-frame timestamp
+    assert cam.status() is HealthStatus.OK
+    clock.advance(3.0)  # > stale_timeout (2.0) with no new frames
+    assert cam.is_stale() is True
+    assert cam.status() is HealthStatus.DEGRADED
     cam.close()
 
 

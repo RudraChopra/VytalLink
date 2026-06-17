@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 from vytallink.common.clock import Clock, SystemClock
 from vytallink.common.errors import DatabaseError
 from vytallink.common.logging_setup import get_logger
+from vytallink.common.sanitize import safe_path
 from vytallink.database.schema import LATEST_SCHEMA_VERSION, MIGRATIONS
 
 log = get_logger("database")
@@ -140,11 +141,13 @@ class Database:
             return {
                 "ok": True,
                 "schema_version": int(version),
-                "path": str(self.path),
+                # Filename only — never the absolute path (it embeds the
+                # local username / home directory). See common.sanitize.
+                "name": safe_path(self.path),
                 "writable": self._is_writable(),
             }
         except Exception as exc:  # pragma: no cover - defensive
-            return {"ok": False, "error": str(exc), "path": str(self.path)}
+            return {"ok": False, "error": str(exc), "name": safe_path(self.path)}
 
     def _is_writable(self) -> bool:
         if str(self.path) == ":memory:":

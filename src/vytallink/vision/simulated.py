@@ -41,3 +41,24 @@ class SimulatedCamera(CameraProvider):
 
     def _close_source(self) -> None:
         return None
+
+    # -- health ------------------------------------------------------------
+    def is_stale(self) -> bool:
+        """A simulated camera carries no live video and produces a synthetic
+        frame only when ``read()`` is called. Being *open with zero frames so
+        far* is therefore normal, not stale — the simulation pipeline drives
+        detections directly and need not pump synthetic frames. Once frames
+        have actually flowed, fall back to the base frame-age staleness check
+        (a stalled read loop is still a real, reportable condition)."""
+        if self._last_frame_mono is None:
+            return False
+        return super().is_stale()
+
+    def health(self) -> dict[str, Any]:
+        h = super().health()
+        # Explicitly mark this as simulated, no live video. These fields make it
+        # clear to callers that frame_count == 0 / no pixel data is expected and
+        # must not be read as a degraded real camera.
+        h["simulated"] = True
+        h["live_video_available"] = False
+        return h
