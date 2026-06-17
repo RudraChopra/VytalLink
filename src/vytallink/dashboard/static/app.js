@@ -61,18 +61,7 @@ function renderHealth(h) {
   $("vitals-sim").hidden = !sim;
 
   renderHardware(h);
-
-  // Live camera feed (opt-in; off by default). Set the stream src once.
-  const liveOn = !!h.live_video;
-  const liveCard = $("live-card");
-  if (liveCard) {
-    liveCard.hidden = !liveOn;
-    const img = $("live-img");
-    if (img) {
-      if (liveOn && !img.getAttribute("src")) img.setAttribute("src", "/api/camera/stream");
-      if (!liveOn) img.removeAttribute("src");
-    }
-  }
+  renderLiveVideo(h);
 
   // Warnings.
   const warnings = [];
@@ -86,6 +75,81 @@ function renderHealth(h) {
   // Dev controls visibility.
   CONTROLS_ENABLED = !!(h.simulation && h.simulation.controls_enabled);
   $("dev-controls").hidden = !CONTROLS_ENABLED;
+}
+
+// --- live video -----------------------------------------------------------
+// The token (when the feed is protected) lives ONLY in memory and is sent via
+// the Authorization: Bearer header — never in a URL, cookie, or the page source.
+let VIDEO_TOKEN = null;
+let videoTimer = null;
+
+function stopProtectedFeed() {
+  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  const img = $("live-img");
+  if (img && img.src && img.src.startsWith("blob:")) { URL.revokeObjectURL(img.src); img.removeAttribute("src"); }
+}
+
+function startProtectedFeed() {
+  if (videoTimer) return;
+  const img = $("live-img");
+  const poll = async () => {
+    try {
+      const res = await fetch("/api/camera/snapshot.jpg", {
+        headers: { Authorization: "Bearer " + VIDEO_TOKEN }, cache: "no-store",
+      });
+      if (res.status === 401) {
+        VIDEO_TOKEN = null; stopProtectedFeed();
+        $("video-unlock").hidden = false;
+        const e = $("video-error"); e.hidden = false; e.textContent = "token rejected";
+        return;
+      }
+      if (res.ok && img) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const old = img.src; img.src = url;
+        if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+      }
+    } catch (_) { /* transient; keep polling */ }
+  };
+  videoTimer = setInterval(poll, 200); // ~5 fps
+  poll();
+}
+
+function unlockVideo() {
+  const t = $("video-token-input").value.trim();
+  if (!t) return;
+  VIDEO_TOKEN = t;
+  $("video-token-input").value = "";
+  $("video-unlock").hidden = true;
+  $("video-error").hidden = true;
+  startProtectedFeed();
+}
+
+function renderLiveVideo(h) {
+  const liveOn = !!h.live_video;
+  const card = $("live-card");
+  if (!card) return;
+  card.hidden = !liveOn;
+  const img = $("live-img");
+  if (!liveOn) {                       // feature off
+    stopProtectedFeed();
+    if (img) img.removeAttribute("src");
+    $("video-unlock").hidden = true;
+    return;
+  }
+  if (h.video_protected) {             // token required
+    if (VIDEO_TOKEN === null) {
+      $("video-unlock").hidden = false;
+      if (img && img.src && !img.src.startsWith("blob:")) img.removeAttribute("src");
+    } else {
+      $("video-unlock").hidden = true;
+      startProtectedFeed();
+    }
+  } else {                             // open feed: smooth MJPEG via <img>
+    stopProtectedFeed();
+    $("video-unlock").hidden = true;
+    if (img && !img.getAttribute("src")) img.setAttribute("src", "/api/camera/stream");
+  }
 }
 
 function renderHardware(h) {
@@ -221,6 +285,10 @@ function init() {
   $("btn-fall").addEventListener("click", () => sim("fall"));
   $("btn-normal").addEventListener("click", () => sim("normal"));
   $("btn-reset").addEventListener("click", () => sim("reset"));
+  const unlockBtn = $("video-unlock-btn");
+  if (unlockBtn) unlockBtn.addEventListener("click", unlockVideo);
+  const tokenInput = $("video-token-input");
+  if (tokenInput) tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") unlockVideo(); });
   refresh();
   setInterval(refresh, POLL_MS);
 }

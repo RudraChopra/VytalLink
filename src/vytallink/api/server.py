@@ -73,6 +73,24 @@ def _svc(request: Request) -> MonitoringService:
     return request.app.state.service
 
 
+def _video_authorized(request: Request, svc: MonitoringService) -> bool:
+    """Authorize a live-video request. When DASHBOARD_VIDEO_TOKEN is unset the
+    feed is open (flag-gated only); when set, an ``Authorization: Bearer <token>``
+    header is required. The token is never read from the URL and never logged."""
+    if not svc.video_token_required():
+        return True
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and svc.check_video_token(token.strip())
+
+
+def _video_unauthorized() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"error": "unauthorized", "detail": "Valid video token required."},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 # --- error handling -------------------------------------------------------
 def _register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(NotFoundError)
@@ -182,6 +200,8 @@ def _register_routes(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
             )
+        if not _video_authorized(request, svc):
+            return _video_unauthorized()
         jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
         if jpeg is None:
             return JSONResponse(
@@ -196,6 +216,8 @@ def _register_routes(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
             )
+        if not _video_authorized(request, svc):
+            return _video_unauthorized()
 
         async def gen():
             # Encode each frame OFF the event loop and cap the rate so the live

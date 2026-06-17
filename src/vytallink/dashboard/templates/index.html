@@ -76,6 +76,13 @@
         footage is saved. In simulation mode it shows a placeholder until a real
         camera is connected.
       </p>
+      <div id="video-unlock" class="video-unlock" hidden>
+        <span class="muted">This feed is token-protected.</span>
+        <input id="video-token-input" type="password" autocomplete="off"
+               placeholder="Video access token" />
+        <button id="video-unlock-btn" class="btn">Unlock feed</button>
+        <span id="video-error" class="chip chip-down" hidden></span>
+      </div>
       <img id="live-img" class="live-img" alt="Live camera feed" />
     </section>
 

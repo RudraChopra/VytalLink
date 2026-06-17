@@ -150,6 +150,11 @@ class Settings(BaseSettings):
     dashboard_live_video: bool = Field(
         default=False, validation_alias="DASHBOARD_LIVE_VIDEO"
     )
+    # Optional shared secret. When set, the live-video endpoints require
+    # ``Authorization: Bearer <token>``. Treated as a secret (never logged/returned).
+    dashboard_video_token: str = Field(
+        default="", validation_alias="DASHBOARD_VIDEO_TOKEN"
+    )
 
     # ----------------------------------------------------------------------
     # Validators
@@ -364,6 +369,8 @@ class Settings(BaseSettings):
             "webhook_url": sanitize_url(self.webhook_url),
             "webhook_secret": sanitize_secret(self.webhook_secret),
             "console_alerts_enabled": self.console_alerts_enabled,
+            "dashboard_live_video": self.dashboard_live_video,
+            "dashboard_video_token": sanitize_secret(self.dashboard_video_token),
         }
 
     def ensure_runtime_dirs(self) -> None:

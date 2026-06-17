@@ -21,6 +21,7 @@ failure never crashes the service.
 from __future__ import annotations
 
 import asyncio
+import hmac
 from datetime import datetime
 from typing import Any
 
@@ -402,6 +403,8 @@ class MonitoringService:
                 "controls_enabled": self.controls_enabled(),
             },
             "live_video": self.live_video_enabled(),
+            # Whether a token is required to view the feed (NOT the token itself).
+            "video_protected": self.video_token_required(),
         }
 
     def controls_enabled(self) -> bool:
@@ -413,6 +416,18 @@ class MonitoringService:
         """Live camera feed is served only when explicitly enabled AND in
         development. The default posture is no live feed (see CLAUDE.md)."""
         return bool(self.settings.dashboard_live_video) and self.settings.is_development
+
+    def video_token_required(self) -> bool:
+        """True when a DASHBOARD_VIDEO_TOKEN is configured (feed is protected)."""
+        return bool(self.settings.dashboard_video_token)
+
+    def check_video_token(self, token: str | None) -> bool:
+        """Constant-time check of a presented video token against the configured
+        secret. Returns False if no token is configured or none was presented."""
+        configured = self.settings.dashboard_video_token
+        if not configured or not token:
+            return False
+        return hmac.compare_digest(str(token), configured)
 
     def _placeholder_image(self) -> Any:
         import numpy as np  # noqa: WPS433

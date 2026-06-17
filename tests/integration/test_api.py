@@ -100,10 +100,67 @@ def test_live_video_snapshot_when_enabled(live_client):
     # MJPEG generator and TestClient would block. The snapshot exercises the same
     # gating + encode path with a finite response.
     assert live_client.get("/health").json()["live_video"] is True
+    assert live_client.get("/health").json()["video_protected"] is False  # open by default
     r = live_client.get("/api/camera/snapshot.jpg")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/jpeg"
     assert r.content[:2] == b"\xff\xd8"  # JPEG magic bytes (placeholder in sim)
+
+
+VIDEO_TOKEN = "tok_live_sup3r_secret_value_42"
+
+
+@pytest.fixture
+def token_client(tmp_path):
+    settings = _settings(tmp_path, dashboard_live_video=True, dashboard_video_token=VIDEO_TOKEN)
+    service = MonitoringService(settings)
+    app = create_app(settings, service)
+    with TestClient(app) as c:
+        c._service = service  # type: ignore[attr-defined]
+        yield c
+
+
+def test_protected_video_rejects_missing_token(token_client):
+    assert token_client.get("/health").json()["video_protected"] is True
+    r = token_client.get("/api/camera/snapshot.jpg")  # no Authorization header
+    assert r.status_code == 401
+    assert r.headers.get("www-authenticate") == "Bearer"
+    # The /stream endpoint also rejects before opening a stream (safe to GET).
+    assert token_client.get("/api/camera/stream").status_code == 401
+
+
+def test_protected_video_rejects_wrong_token(token_client):
+    r = token_client.get(
+        "/api/camera/snapshot.jpg", headers={"Authorization": "Bearer not-the-token"}
+    )
+    assert r.status_code == 401
+    # Wrong scheme is also rejected.
+    assert token_client.get(
+        "/api/camera/snapshot.jpg", headers={"Authorization": VIDEO_TOKEN}
+    ).status_code == 401
+
+
+def test_protected_video_accepts_correct_token(token_client):
+    r = token_client.get(
+        "/api/camera/snapshot.jpg", headers={"Authorization": f"Bearer {VIDEO_TOKEN}"}
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content[:2] == b"\xff\xd8"
+
+
+def test_video_token_and_credentials_never_in_health(token_client):
+    # health/status must reveal that the feed is protected, but never the token,
+    # and never camera credentials or a model filesystem path.
+    health_text = token_client.get("/health").text
+    status_text = token_client.get("/api/status").text
+    blob = health_text + status_text
+    assert VIDEO_TOKEN not in blob
+    assert "Bearer" not in blob
+    for secret in ("password", "Yeettheworld", "rudrachopra"):
+        assert secret not in blob
+    # video_protected flag present (bool), token absent
+    assert token_client.get("/health").json()["video_protected"] is True
 
 
 def test_status_endpoint(client):
