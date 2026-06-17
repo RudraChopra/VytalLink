@@ -46,10 +46,14 @@ start_app() {
   # DISK_WARNING_PERCENT is raised so the smoke test validates the app pipeline
   # rather than the host's disk fill: a dev machine with a >90%-full disk would
   # otherwise report overall=degraded. Production keeps the 90% default.
+  # ALERTS_ENABLED/CONSOLE_ALERTS_ENABLED are pinned ON so the alert-delivery
+  # checks are hermetic and never depend on the developer's local .env (which may
+  # disable alerts for a live hardware test).
   VYTALLINK_ENV=development VISION_MODE=simulation DETECTOR_MODE=simulation \
   WEARABLE_MODE=simulation VYTALLINK_PORT="$PORT" \
   VYTALLINK_DATABASE_PATH="$SMOKE_DB" VYTALLINK_LOG_DIR="$ROOT/logs" \
   WEARABLE_SAMPLE_SECONDS=1.0 DISK_WARNING_PERCENT=100.0 \
+  ALERTS_ENABLED=true CONSOLE_ALERTS_ENABLED=true \
     nohup "$PY" -m vytallink.app >>"$SMOKE_LOG" 2>&1 &
   APP_PID=$!
 }

@@ -31,6 +31,7 @@ disk.
 from __future__ import annotations
 
 import threading
+from collections import deque
 from typing import Any, Iterable, Iterator
 
 from vytallink.common.errors import CameraError
@@ -81,6 +82,7 @@ class HttpCamera(CameraProvider):
     """Latest-frame camera over an HTTP relay (MJPEG preferred, snapshot fallback)."""
 
     description = "HTTP relay camera"
+    has_latest_buffer = True
 
     def __init__(
         self,
@@ -116,6 +118,7 @@ class HttpCamera(CameraProvider):
         self._frames_grabbed = 0
         self._frames_consumed = 0
         self._frames_failed = 0  # cumulative failed reads (network/decode)
+        self._grab_marks: deque[float] = deque(maxlen=30)  # grab times -> ingest FPS
         self._last_grab_mono: float | None = None
         self._grab_error: str | None = None  # sanitized (type name only)
         self._resolution: tuple[int, int] | None = None
@@ -294,6 +297,7 @@ class HttpCamera(CameraProvider):
             self._latest_seq += 1
             self._frames_grabbed += 1
             self._last_grab_mono = self.clock.monotonic()
+            self._grab_marks.append(self._last_grab_mono)
             if self._resolution is None:
                 try:
                     h, w = image.shape[:2]
@@ -301,6 +305,31 @@ class HttpCamera(CameraProvider):
                 except Exception:  # pragma: no cover - defensive
                     pass
         return True
+
+    def peek_latest(self) -> tuple[Any, int, float] | None:
+        with self._grab_lock:
+            if self._latest is None:
+                return None
+            grab = self._last_grab_mono
+            age = 0.0 if grab is None else max(0.0, self.clock.monotonic() - grab)
+            return (self._latest, self._latest_seq, age)
+
+    # -- grabber-based liveness (independent of consumer read cadence) ------
+    def effective_fps(self) -> float:
+        """True ingest rate = the grabber's receive rate, regardless of how often
+        a consumer reads/peeks (the detection loop is paced separately)."""
+        with self._grab_lock:
+            marks = list(self._grab_marks)
+        if len(marks) < 2:
+            return 0.0
+        span = marks[-1] - marks[0]
+        return round((len(marks) - 1) / span, 2) if span > 0 else 0.0
+
+    def is_stale(self) -> bool:
+        grab = self._last_grab_mono
+        if grab is None:
+            return self._opened  # opened but the grabber has produced no frame yet
+        return (self.clock.monotonic() - grab) > self.stale_timeout
 
     def _read_frame(self) -> Any | None:
         with self._grab_lock:

@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from vytallink.common.clock import Clock, SystemClock
-from vytallink.common.device import CPU_DEVICE, MPS_DEVICE, select_device, synchronize_device
+from vytallink.common.device import (
+    CPU_DEVICE,
+    MPS_DEVICE,
+    device_label,
+    select_device,
+    synchronize_device,
+)
 from vytallink.common.errors import DetectorError
 from vytallink.common.logging_setup import get_logger
 from vytallink.common.types import Frame, HealthStatus, RawDetection
@@ -359,6 +365,7 @@ class YoloFallDetector(FallDetector):
             "task": self.task,
             "classes": list(self.class_names.values()),
             "device": self.device_str,
+            "device_label": device_label(self.device_str),
             "cuda": self.device_str.startswith("cuda"),
             "mps": self.device_str == MPS_DEVICE,
             "mps_fallback": self.mps_fallback_reason,

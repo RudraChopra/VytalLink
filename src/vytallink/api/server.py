@@ -219,22 +219,40 @@ def _register_routes(app: FastAPI) -> None:
         if not _video_authorized(request, svc):
             return _video_unauthorized()
 
+        frame_interval = 1.0 / max(0.1, svc.settings.relay_max_fps)
+
         async def gen():
-            # Encode each frame OFF the event loop and cap the rate so the live
-            # feed never starves the API. Stops when the client disconnects.
+            # Encode each frame OFF the event loop and cap the rate (RELAY_MAX_FPS)
+            # so the live feed never starves the API. Stops when the client
+            # disconnects; an encode error is logged (sanitized) and closes cleanly.
             while True:
                 if await request.is_disconnected():
                     break
-                jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+                try:
+                    jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("Live MJPEG frame failed: %s", type(exc).__name__)
+                    break
                 if jpeg is not None:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-                await asyncio.sleep(0.1)  # ~10 fps
+                await asyncio.sleep(frame_interval)
 
         return StreamingResponse(
             gen(),
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-store"},
         )
+
+    # -- detector debug (development only; no images/credentials/paths) -----
+    @app.get("/api/detector/debug")
+    async def detector_debug(request: Request):
+        svc = _svc(request)
+        if not svc.settings.is_development:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found", "detail": "Debug metrics are development-only."},
+            )
+        return svc.debug_metrics()
 
     # -- simulation controls (development + simulation only) ---------------
     @app.post("/api/simulation/fall")

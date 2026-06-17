@@ -22,15 +22,17 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+from collections import deque
 from datetime import datetime
 from typing import Any
 
 from vytallink import __phase__, __version__
 from vytallink.alerts.factory import build_dispatcher
 from vytallink.common.clock import ManualClock, SystemClock, isoformat
+from vytallink.common.device import device_label
 from vytallink.common.errors import CameraError
 from vytallink.common.logging_setup import get_logger
-from vytallink.common.types import Frame, HealthStatus
+from vytallink.common.types import Frame, HealthStatus, RawDetection
 from vytallink.config import Settings, VisionMode
 from vytallink.database import Database, DeviceRow, Repositories, VitalRow
 from vytallink.events import EventManager, FallEventStateMachine, FallState
@@ -99,9 +101,25 @@ class MonitoringService:
         self._last_inference_time: datetime | None = None
         self._last_vital: VitalRow | None = None
         self._sim_lock = asyncio.Lock()
-        # Latest decoded camera frame (BGR ndarray) for the optional live feed.
-        # Held in memory only — never written to disk.
+        # Latest decoded camera frame (BGR ndarray) the DETECTOR last processed —
+        # used for the annotated preview (boxes align with this frame). The raw
+        # live feed serves the camera's freshest frame directly (see
+        # latest_frame_jpeg), decoupled from the detection loop. In-memory only —
+        # never written to disk.
         self._last_frame_image: Any | None = None
+
+        # --- live-detection pacing / debug state ---------------------------
+        self._last_processed_seq: int | None = None  # de-dup: skip re-sent frames
+        self._frames_dropped_stale = 0   # intentionally dropped (too old) — NOT failed reads
+        self._frames_processed = 0       # frames that actually ran inference
+        self._frames_with_fallen = 0
+        self._class_counts: dict[str, int] = {}
+        self._last_detections: list[RawDetection] = []
+        self._last_detection_summary: list[dict[str, Any]] = []
+        self._last_evidence: bool = False
+        self._last_evidence_score: float = 0.0
+        self._last_frame_age: float = 0.0
+        self._transitions: deque[dict[str, Any]] = deque(maxlen=25)
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -228,14 +246,37 @@ class MonitoringService:
         self._update_device(reading.device_id, HealthStatus.OK, seen=True)
 
     async def _monitor_loop(self) -> None:
+        if self.simulation_mode:
+            await self._simulation_heartbeat_loop()
+        else:
+            await self._live_detection_loop()
+
+    async def _simulation_heartbeat_loop(self) -> None:
         interval = max(0.05, self.settings.monitor_loop_interval)
         try:
             while self._running:
                 await asyncio.sleep(interval)
-                if self.simulation_mode:
-                    self._heartbeat_once()  # health only; does not observe
-                else:
-                    await self._detect_and_observe_once()
+                self._heartbeat_once()  # health only; does not observe
+        except asyncio.CancelledError:  # pragma: no cover - shutdown
+            raise
+
+    async def _live_detection_loop(self) -> None:
+        """Live mode: run inference on the FRESHEST frame, paced to detect_max_fps.
+
+        No fixed per-frame sleep — the loop runs as fast as inference allows up to
+        the cap, so a fast model is not throttled. Camera ingest runs in the
+        provider's own grabber thread, so detection never blocks ingest; the
+        dashboard encodes off this loop (in the request handler), so it never
+        blocks inference.
+        """
+        min_interval = 1.0 / max(0.1, self.settings.detect_max_fps)
+        try:
+            while self._running:
+                t0 = self.system_clock.monotonic()
+                await self._detect_and_observe_once()
+                dt = self.system_clock.monotonic() - t0
+                # Pace to the cap; if there is no new frame the loop idles here.
+                await asyncio.sleep(max(0.0, min_interval - dt))
         except asyncio.CancelledError:  # pragma: no cover - shutdown
             raise
 
@@ -252,16 +293,14 @@ class MonitoringService:
         return frame
 
     def _detect_once(self) -> tuple[bool, float]:
+        """Simulation path: read + infer the (scenario-driven) simulated frame."""
         frame = self._read_frame_for_detection()
         if frame is None:
             self._update_device(self.settings.camera_device_id, self.camera.status())
             return False, 0.0
         if frame.image is not None:
-            # Keep only the newest frame in memory for the optional live feed.
             self._last_frame_image = frame.image
         detections = self.detector.infer(frame)
-        # Only advance the "last inference" timestamp on a successful inference, so
-        # a detector that fails every frame does not look alive on the dashboard.
         if getattr(self.detector, "last_infer_ok", True):
             self._last_inference_time = self.system_clock.now()
         self._update_device(self.settings.camera_device_id, self.camera.status(), seen=True)
@@ -277,17 +316,115 @@ class MonitoringService:
             )
         return evidence, confidence
 
+    def _detect_once_live(self) -> tuple[bool, float] | None:
+        """Live path on the FRESHEST frame. Returns the (evidence, confidence) to
+        observe, or ``None`` when there is no new fresh frame to act on this tick
+        (no frame / duplicate / intentionally dropped because too old)."""
+        cam_id = self.settings.camera_device_id
+        if not getattr(self.camera, "has_latest_buffer", False):
+            # Sequential source (e.g. a video file) — read frames in order.
+            frame = self.camera.read()
+            self._update_device(cam_id, self.camera.status(), seen=frame is not None)
+            if frame is None or frame.image is None:
+                return None
+            self._last_frame_age = 0.0
+            return self._infer_and_score(frame, frame.image)
+
+        # Drive the provider's liveness + bounded-backoff reconnection + counters
+        # without letting it pace detection: read() returns the latest (or None on
+        # a real stall) and reopens a dead grabber. We do NOT reconnect just
+        # because we poll slowly — the loop polls fast and the grabber owns ingest.
+        self.camera.read()
+        peek = self.camera.peek_latest()
+        if peek is None:
+            # Buffered source with no frame yet (e.g. opening / reconnecting).
+            self._update_device(cam_id, self.camera.status(), seen=False)
+            return None
+        self._update_device(cam_id, self.camera.status(), seen=True)
+        image, seq, age = peek
+        self._last_frame_age = round(age, 3)
+        # De-dup: the relay may re-send the same frame; only process new captures.
+        if seq == self._last_processed_seq:
+            return None
+        self._last_processed_seq = seq
+        # Drop a stale frame BEFORE inference — always work on fresh frames.
+        if age > self.settings.detect_max_frame_age_seconds:
+            self._frames_dropped_stale += 1
+            return None
+
+        h, w = (image.shape[0], image.shape[1]) if hasattr(image, "shape") else (0, 0)
+        frame = Frame(
+            frame_id=seq,
+            timestamp=self.system_clock.now(),
+            source_id=cam_id,
+            width=int(w),
+            height=int(h),
+            image=image,
+        )
+        return self._infer_and_score(frame, image)
+
+    def _infer_and_score(self, frame: Frame, image: Any) -> tuple[bool, float]:
+        detections = self.detector.infer(frame)
+        if getattr(self.detector, "last_infer_ok", True):
+            self._last_inference_time = self.system_clock.now()
+        # Keep the processed frame + its detections for the annotated preview
+        # (boxes align with THIS frame). Never run the detector twice for drawing.
+        self._last_frame_image = image
+        self._last_detections = detections
+        self._record_detection_debug(detections)
+
+        evidence, confidence = detections_to_evidence(
+            detections, self.settings.fall_class_set, self.settings.confidence_threshold
+        )
+        if self._evidence_smoother is not None:
+            fall_set = self.settings.fall_class_set
+            had_detection = bool(detections)
+            had_upright = any(d.class_name.lower() not in fall_set for d in detections)
+            evidence, confidence = self._evidence_smoother.update(
+                evidence, confidence, had_detection=had_detection, had_upright=had_upright
+            )
+        self._last_evidence = evidence
+        self._last_evidence_score = round(float(confidence), 4)
+        return evidence, confidence
+
+    def _record_detection_debug(self, detections: list[RawDetection]) -> None:
+        self._frames_processed += 1
+        fall_set = self.settings.fall_class_set
+        summary: list[dict[str, Any]] = []
+        saw_fallen = False
+        for d in detections:
+            name = d.class_name.lower()
+            self._class_counts[name] = self._class_counts.get(name, 0) + 1
+            summary.append({"class": d.class_name, "confidence": round(d.confidence, 3)})
+            if name in fall_set:
+                saw_fallen = True
+        if saw_fallen:
+            self._frames_with_fallen += 1
+        # Newest first; cap the per-frame summary so it stays small/safe.
+        self._last_detection_summary = summary[:8]
+
     def _heartbeat_once(self) -> None:
         # Read + infer for liveness/health, but do NOT feed the state machine.
         self._detect_once()
 
     async def _detect_and_observe_once(self) -> None:
         # Camera read + model inference are blocking native calls (cv2 / torch).
-        # Offload them to a worker thread so a slow/bad RTSP source can never
-        # freeze the event loop (and thus the API). The DB is lock-guarded and
-        # safe to touch from the worker thread. observe() stays on the loop.
-        evidence, confidence = await asyncio.to_thread(self._detect_once)
-        await self.event_manager.observe(evidence, confidence)
+        # Offload to a worker thread so a slow source can never freeze the event
+        # loop (and thus the API). observe() + transition recording stay on loop.
+        result = await asyncio.to_thread(self._detect_once_live)
+        if result is None:
+            return  # no new fresh frame this tick
+        evidence, confidence = result
+        transitions = await self.event_manager.observe(evidence, confidence)
+        for t in transitions:
+            self._transitions.append(
+                {
+                    "from": t.from_state.value,
+                    "to": t.to_state.value,
+                    "reason": getattr(t.reason, "value", str(t.reason)),
+                    "time": isoformat(t.timestamp),
+                }
+            )
 
     # -- simulation controls (deterministic, real pipeline) ----------------
     def _ensure_simulatable(self) -> None:
@@ -358,6 +495,15 @@ class MonitoringService:
     def health(self) -> dict[str, Any]:
         db_health = self.db.health()
         cam_health = self.camera.health()
+        # Intentionally-dropped (too-old) frames are tracked by the service, not
+        # the provider; surface them alongside the provider's failed-read count so
+        # the two are never conflated on the dashboard.
+        if not self.simulation_mode:
+            cam_health = {
+                **cam_health,
+                "frames_processed": self._frames_processed,
+                "frames_dropped_stale": self._frames_dropped_stale,
+            }
         wear_health = self.wearable.health()
         det_health = self._detector_health()
         disk = system_info.disk_info(self.settings.database_path, self.settings.disk_warning_percent)
@@ -447,20 +593,140 @@ class MonitoringService:
             pass
         return img
 
-    def latest_frame_jpeg(self, quality: int = 70) -> bytes | None:
-        """Encode the newest frame (or a placeholder) as JPEG bytes. No footage is
-        written to disk. Intended to be called OFF the event loop (asyncio.to_thread)."""
-        img = self._last_frame_image
-        if img is None:
-            img = self._placeholder_image()
+    def _freshest_image(self) -> Any | None:
+        """The freshest decoded camera frame (grabber rate), decoupled from the
+        detection loop, for a low-latency raw live feed. Falls back to the last
+        processed frame, then ``None``."""
+        try:
+            peek = self.camera.peek_latest()
+        except Exception:  # pragma: no cover - defensive
+            peek = None
+        if peek is not None:
+            return peek[0]
+        return self._last_frame_image
+
+    def _downscale_for_relay(self, img: Any) -> Any:
+        """Downscale a COPY of ``img`` to fit RELAY_WIDTH×RELAY_HEIGHT (aspect
+        preserved). Returns the original when downscaling is disabled (0) or the
+        frame already fits. Never mutates the detection input."""
+        rw, rh = self.settings.relay_width, self.settings.relay_height
+        if rw <= 0 or rh <= 0:
+            return img
         try:
             import cv2  # noqa: WPS433
 
-            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+            h, w = img.shape[:2]
+            if w <= rw and h <= rh:
+                return img
+            scale = min(rw / float(w), rh / float(h))
+            new = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+            return cv2.resize(img, new, interpolation=cv2.INTER_AREA)
+        except Exception:  # pragma: no cover - defensive
+            return img
+
+    def _build_annotated_image(self) -> Any | None:
+        """Draw the detector's EXISTING boxes for the last processed frame (never
+        re-runs YOLO) plus detector FPS, frame age, and fall-state overlay."""
+        base = self._last_frame_image
+        if base is None:
+            return self._freshest_image()
+        try:
+            import cv2  # noqa: WPS433
+
+            img = base.copy()
+            fall_set = self.settings.fall_class_set
+            for d in self._last_detections:
+                x1, y1, x2, y2 = (int(v) for v in d.bbox)
+                is_fall = d.class_name.lower() in fall_set
+                color = (60, 60, 230) if is_fall else (90, 200, 120)  # BGR
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(img, f"{d.class_name} {d.confidence:.2f}", (x1, max(16, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            det_fps = getattr(self.detector, "inference_fps", lambda: None)()
+            overlay = (f"state={self.state_machine.state.value}  det_fps={det_fps}  "
+                       f"age={self._last_frame_age}s  score={self._last_evidence_score}")
+            cv2.putText(img, overlay, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
+            return img
+        except Exception:  # pragma: no cover - defensive
+            return base
+
+    def latest_frame_jpeg(
+        self,
+        quality: int | None = None,
+        *,
+        allow_placeholder: bool = True,
+        annotated: bool | None = None,
+    ) -> bytes | None:
+        """Encode the live frame as JPEG bytes, downscaled to the relay size. No
+        footage is written to disk. Call OFF the event loop (asyncio.to_thread).
+
+        ``annotated`` (default: DASHBOARD_SHOW_DETECTIONS in a live mode) draws the
+        detector's existing boxes — YOLO is never re-run. ``allow_placeholder=False``
+        returns ``None`` when there is no real frame yet."""
+        if annotated is None:
+            annotated = self.settings.dashboard_show_detections and not self.simulation_mode
+        img = self._build_annotated_image() if annotated else self._freshest_image()
+        if img is None:
+            if not allow_placeholder:
+                return None
+            img = self._placeholder_image()
+        q = self.settings.relay_jpeg_quality if quality is None else int(quality)
+        try:
+            import cv2  # noqa: WPS433
+
+            img = self._downscale_for_relay(img)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(q)])
             return buf.tobytes() if ok else None
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("Live frame encode failed: %s", type(exc).__name__)
             return None
+
+    def debug_metrics(self) -> dict[str, Any]:
+        """Safe development metrics for diagnosing detections — no images,
+        credentials, or filesystem paths."""
+        ev = self.state_machine.current_event
+        candidate_seconds = 0.0
+        if ev is not None and self.state_machine.state == FallState.POSSIBLE_FALL:
+            candidate_seconds = round(
+                max(0.0, self.system_clock.monotonic() - ev.possible_since), 2
+            )
+        det = self._detector_health()
+        cam = self.camera.health()
+        return {
+            "fall_state": self.state_machine.state.value,
+            "frames_processed": self._frames_processed,
+            "frames_with_fallen": self._frames_with_fallen,
+            "frames_dropped_stale": self._frames_dropped_stale,
+            "class_counts": dict(self._class_counts),
+            "last_detections": self._last_detection_summary,
+            "last_evidence": self._last_evidence,
+            "evidence_score": self._last_evidence_score,
+            "last_frame_age_seconds": self._last_frame_age,
+            "fall_candidate_seconds": candidate_seconds,
+            "confirm_seconds": self.settings.fall_confirm_seconds,
+            "clear_seconds": self.settings.fall_clear_seconds,
+            "confidence_threshold": self.settings.confidence_threshold,
+            "require_transition": self.settings.require_fall_transition,
+            "fall_classes": sorted(self.settings.fall_class_set),
+            "transitions": list(self._transitions),
+            "detector": {
+                "device": det.get("device"),
+                "device_label": det.get("device_label"),
+                "inference_fps": det.get("inference_fps"),
+                "avg_inference_ms": det.get("avg_inference_ms"),
+                "inference_count": det.get("inference_count"),
+            },
+            "camera": {
+                "effective_fps": cam.get("effective_fps"),
+                "frames_grabbed": cam.get("frames_grabbed"),
+                "frames_consumed": cam.get("frames_consumed"),
+                "frames_dropped": cam.get("frames_dropped"),
+                "frames_dropped_stale": self._frames_dropped_stale,
+                "failed_reads": cam.get("failed_reads"),
+                "reconnects": cam.get("reconnects"),
+                "last_frame_age_seconds": cam.get("last_frame_age_seconds"),
+            },
+        }
 
     def status(self) -> dict[str, Any]:
         sm = self.event_manager.status()

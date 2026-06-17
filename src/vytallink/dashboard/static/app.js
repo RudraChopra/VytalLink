@@ -49,16 +49,19 @@ function renderHealth(h) {
   $("s-camera").innerHTML = chip(h.camera && h.camera.status);
   $("s-detector").innerHTML = chip(h.detector && h.detector.status);
   $("s-wearable").innerHTML = chip(h.wearable && h.wearable.status);
-  $("s-gpu").textContent = h.gpu && h.gpu.available ? "available" : "unavailable";
+  // Inference device: show the actual accelerator (Apple MPS / CUDA / CPU).
+  const det0 = h.detector || {};
+  $("s-gpu").textContent = det0.device_label || det0.device || "—";
   $("s-db").innerHTML = chip(h.database && h.database.status);
   $("s-uptime").textContent = fmtUptime(h.uptime_seconds);
   $("version").textContent = "v" + (h.version || "?");
 
-  // Simulation / live indicators.
-  const sim = h.simulation && h.simulation.active;
-  $("sim-indicator").hidden = !sim;
-  $("live-indicator").hidden = sim;
-  $("vitals-sim").hidden = !sim;
+  // Exactly ONE top-level mode badge: SIMULATION xor LIVE (driven by the
+  // single authoritative flag h.simulation.active = vision in simulation).
+  const isSim = !!(h.simulation && h.simulation.active);
+  $("sim-indicator").hidden = isSim ? false : true;
+  $("live-indicator").hidden = isSim ? true : false;
+  $("vitals-sim").hidden = !isSim;
 
   renderHardware(h);
   renderLiveVideo(h);
@@ -158,7 +161,9 @@ function renderHardware(h) {
   const gpu = h.gpu || {};
   const sim = !!(h.simulation && h.simulation.active);
   const mode = $("hw-mode");
-  mode.textContent = sim ? "simulation" : (h.mode || "live");
+  // Transport detail (e.g. "http_mjpeg") — the single LIVE/SIMULATION badge lives
+  // in the top bar; this tag is just the source kind, never a duplicate badge.
+  mode.textContent = h.mode || (sim ? "simulation" : "live");
   mode.className = "tag " + (sim ? "" : "tag-live");
   // Never show credentials or a model path — camera_name is already sanitized.
   $("hw-camera").textContent = h.camera_name || cam.description || "—";
@@ -167,12 +172,13 @@ function renderHardware(h) {
   $("hw-resolution").textContent = cam.resolution ? cam.resolution.join("×") : "—";
   $("hw-reconnects").textContent = cam.reconnects != null ? cam.reconnects : "—";
   $("hw-dropped").textContent = cam.frames_dropped != null ? cam.frames_dropped : "—";
-  $("hw-device").textContent = det.device || (sim ? "n/a (sim)" : "—");
+  $("hw-device").textContent = det.device_label || det.device || (sim ? "n/a (sim)" : "—");
   $("hw-inf-fps").textContent = det.inference_fps != null ? det.inference_fps : "—";
   $("hw-inf-ms").textContent = det.avg_inference_ms != null ? det.avg_inference_ms + " ms" : "—";
-  $("hw-gpu").textContent = gpu.available
-    ? (gpu.device_name || "available") + (gpu.compute_capability ? " (sm" + gpu.compute_capability + ")" : "")
-    : "unavailable";
+  // Accelerator detail — shows "Apple MPS available (CUDA unavailable)" etc.
+  $("hw-gpu").textContent = (gpu && gpu.detail)
+    || det.device_label
+    || (sim ? "n/a (sim)" : "—");
   $("hw-last-frame").textContent = fmtTime(h.latest_frame_time);
   $("hw-last-inf").textContent = fmtTime(h.latest_inference_time);
 }

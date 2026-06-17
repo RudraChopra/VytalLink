@@ -98,6 +98,23 @@ def is_accelerator(device: str | None) -> bool:
     return bool(device) and (device.startswith("cuda") or device == MPS_DEVICE)
 
 
+def device_label(device: str | None) -> str:
+    """Human-readable name for an inference device string, for the dashboard.
+
+    ``mps`` -> ``Apple MPS``, ``cuda[:N]`` -> ``CUDA``, ``cpu`` -> ``CPU``.
+    """
+    if not device:
+        return "—"
+    d = device.lower()
+    if d == MPS_DEVICE:
+        return "Apple MPS"
+    if d.startswith("cuda"):
+        return "CUDA"
+    if d == CPU_DEVICE:
+        return "CPU"
+    return device
+
+
 def select_device(preference: str | None = None) -> str:
     """Return the inference device string, probing in order CUDA → MPS → CPU.
 

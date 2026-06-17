@@ -157,6 +157,28 @@ class Settings(BaseSettings):
     )
     disk_warning_percent: float = Field(default=90.0, validation_alias="DISK_WARNING_PERCENT")
 
+    # ---- Live detection pacing (live modes only) --------------------------
+    # The live detection loop runs on the FRESHEST frame, paced to at most this
+    # many inferences/second (it no longer adds a fixed monitor_loop_interval
+    # sleep per frame). Keeps inference latency low without busy-spinning.
+    detect_max_fps: float = Field(default=12.0, validation_alias="DETECT_MAX_FPS")
+    # A frame older than this (seconds, measured from capture into the latest-
+    # frame buffer) is intentionally discarded BEFORE inference so the system
+    # always works on fresh frames instead of a stale backlog.
+    detect_max_frame_age_seconds: float = Field(
+        default=1.0, validation_alias="DETECT_MAX_FRAME_AGE_SECONDS"
+    )
+
+    # ---- HTTP relay / dashboard frame (bandwidth + latency) ---------------
+    # The dashboard/relay JPEG copy is downscaled to fit RELAY_WIDTH×RELAY_HEIGHT
+    # (aspect preserved) and capped at RELAY_MAX_FPS. This ONLY affects the
+    # dashboard/relay copy — never the full-resolution detection input or any
+    # future recording path. 0 disables downscaling.
+    relay_width: int = Field(default=960, validation_alias="RELAY_WIDTH")
+    relay_height: int = Field(default=540, validation_alias="RELAY_HEIGHT")
+    relay_jpeg_quality: int = Field(default=70, validation_alias="RELAY_JPEG_QUALITY")
+    relay_max_fps: float = Field(default=10.0, validation_alias="RELAY_MAX_FPS")
+
     # ---- Dashboard live video (privacy-sensitive; OFF by default) ----------
     # When true (development only), the dashboard exposes the live camera feed.
     # This intentionally overrides the default "no live feed" privacy posture —
@@ -168,6 +190,12 @@ class Settings(BaseSettings):
     # ``Authorization: Bearer <token>``. Treated as a secret (never logged/returned).
     dashboard_video_token: str = Field(
         default="", validation_alias="DASHBOARD_VIDEO_TOKEN"
+    )
+    # Development-only: overlay the detector's bounding boxes / class / confidence
+    # plus detector FPS, frame age, and fall-state on the live feed for debugging.
+    # Uses the detector's EXISTING result for that frame (never re-runs YOLO).
+    dashboard_show_detections: bool = Field(
+        default=False, validation_alias="DASHBOARD_SHOW_DETECTIONS"
     )
 
     # ----------------------------------------------------------------------
@@ -231,6 +259,27 @@ class Settings(BaseSettings):
     def _validate_positive_int(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"value must be >= 1, got {v}")
+        return v
+
+    @field_validator("relay_width", "relay_height")
+    @classmethod
+    def _validate_relay_dim(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"relay dimension must be >= 0 (0 disables downscale), got {v}")
+        return v
+
+    @field_validator("relay_jpeg_quality")
+    @classmethod
+    def _validate_jpeg_quality(cls, v: int) -> int:
+        if not (1 <= v <= 100):
+            raise ValueError(f"relay_jpeg_quality must be in 1..100, got {v}")
+        return v
+
+    @field_validator("detect_max_fps", "relay_max_fps", "detect_max_frame_age_seconds")
+    @classmethod
+    def _validate_positive_float(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"value must be > 0, got {v}")
         return v
 
     @model_validator(mode="after")
