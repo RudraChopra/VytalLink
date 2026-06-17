@@ -98,6 +98,9 @@ class MonitoringService:
         self._last_inference_time: datetime | None = None
         self._last_vital: VitalRow | None = None
         self._sim_lock = asyncio.Lock()
+        # Latest decoded camera frame (BGR ndarray) for the optional live feed.
+        # Held in memory only — never written to disk.
+        self._last_frame_image: Any | None = None
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
@@ -252,6 +255,9 @@ class MonitoringService:
         if frame is None:
             self._update_device(self.settings.camera_device_id, self.camera.status())
             return False, 0.0
+        if frame.image is not None:
+            # Keep only the newest frame in memory for the optional live feed.
+            self._last_frame_image = frame.image
         detections = self.detector.infer(frame)
         # Only advance the "last inference" timestamp on a successful inference, so
         # a detector that fails every frame does not look alive on the dashboard.
@@ -395,11 +401,47 @@ class MonitoringService:
                 "env": self.settings.env.value,
                 "controls_enabled": self.controls_enabled(),
             },
+            "live_video": self.live_video_enabled(),
         }
 
     def controls_enabled(self) -> bool:
         """Dev simulation controls are enabled only in development + simulation."""
         return self.settings.is_development and self.simulation_mode
+
+    # -- live video (optional, privacy-sensitive) --------------------------
+    def live_video_enabled(self) -> bool:
+        """Live camera feed is served only when explicitly enabled AND in
+        development. The default posture is no live feed (see CLAUDE.md)."""
+        return bool(self.settings.dashboard_live_video) and self.settings.is_development
+
+    def _placeholder_image(self) -> Any:
+        import numpy as np  # noqa: WPS433
+
+        img = np.full((360, 640, 3), 32, dtype="uint8")
+        try:
+            import cv2  # noqa: WPS433
+
+            msg = "SIMULATION - no live video" if self.simulation_mode else "Camera offline - no frames yet"
+            cv2.putText(img, "VytalLink live feed", (24, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 200, 255), 2)
+            cv2.putText(img, msg, (24, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        except Exception:  # pragma: no cover - cv2 present on Jetson
+            pass
+        return img
+
+    def latest_frame_jpeg(self, quality: int = 70) -> bytes | None:
+        """Encode the newest frame (or a placeholder) as JPEG bytes. No footage is
+        written to disk. Intended to be called OFF the event loop (asyncio.to_thread)."""
+        img = self._last_frame_image
+        if img is None:
+            img = self._placeholder_image()
+        try:
+            import cv2  # noqa: WPS433
+
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+            return buf.tobytes() if ok else None
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Live frame encode failed: %s", type(exc).__name__)
+            return None
 
     def status(self) -> dict[str, Any]:
         sm = self.event_manager.status()

@@ -77,6 +77,35 @@ def test_overall_health_down_when_detector_down_in_live(client):
     assert client.get("/health").json()["overall"] == "down"
 
 
+def test_live_video_disabled_by_default(client):
+    # Default posture: no live feed. Both endpoints 404 (safe to GET — they return
+    # before opening a stream).
+    assert client.get("/api/camera/snapshot.jpg").status_code == 404
+    assert client.get("/api/camera/stream").status_code == 404
+    assert client.get("/health").json()["live_video"] is False
+
+
+@pytest.fixture
+def live_client(tmp_path):
+    settings = _settings(tmp_path, dashboard_live_video=True)
+    service = MonitoringService(settings)
+    app = create_app(settings, service)
+    with TestClient(app) as c:
+        c._service = service  # type: ignore[attr-defined]
+        yield c
+
+
+def test_live_video_snapshot_when_enabled(live_client):
+    # NOTE: we deliberately do not GET /api/camera/stream here — it is an infinite
+    # MJPEG generator and TestClient would block. The snapshot exercises the same
+    # gating + encode path with a finite response.
+    assert live_client.get("/health").json()["live_video"] is True
+    r = live_client.get("/api/camera/snapshot.jpg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content[:2] == b"\xff\xd8"  # JPEG magic bytes (placeholder in sim)
+
+
 def test_status_endpoint(client):
     r = client.get("/api/status")
     assert r.status_code == 200

@@ -76,6 +76,7 @@ main { max-width: 880px; margin: 0 auto; padding: 16px; }
 .tag-dev { background: rgba(63,182,168,0.18); color: var(--accent); }
 .tag-live { background: rgba(63,185,80,0.18); color: var(--ok); }
 .value-sm { font-size: 0.85rem; word-break: break-all; }
+.live-img { width: 100%; max-width: 720px; display: block; border-radius: 8px; background: #111; aspect-ratio: 16 / 9; object-fit: contain; }
 
 .fall-normal { color: var(--ok); }
 .fall-possible_fall, .fall-recovering { color: var(--warn); }

@@ -8,12 +8,13 @@ without leaking stack traces or secrets.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vytallink import APP_NAME, __version__
@@ -172,6 +173,46 @@ def _register_routes(app: FastAPI) -> None:
             "total": repos.vitals.count(),
             "simulated": _svc(request).simulation_mode,
         }
+
+    # -- live camera feed (opt-in, development only; never saves footage) ---
+    @app.get("/api/camera/snapshot.jpg")
+    async def camera_snapshot(request: Request):
+        svc = _svc(request)
+        if not svc.live_video_enabled():
+            return JSONResponse(
+                status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
+            )
+        jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+        if jpeg is None:
+            return JSONResponse(
+                status_code=503, content={"error": "unavailable", "detail": "No frame available."}
+            )
+        return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/camera/stream")
+    async def camera_stream(request: Request):
+        svc = _svc(request)
+        if not svc.live_video_enabled():
+            return JSONResponse(
+                status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
+            )
+
+        async def gen():
+            # Encode each frame OFF the event loop and cap the rate so the live
+            # feed never starves the API. Stops when the client disconnects.
+            while True:
+                if await request.is_disconnected():
+                    break
+                jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+                if jpeg is not None:
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                await asyncio.sleep(0.1)  # ~10 fps
+
+        return StreamingResponse(
+            gen(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
 
     # -- simulation controls (development + simulation only) ---------------
     @app.post("/api/simulation/fall")

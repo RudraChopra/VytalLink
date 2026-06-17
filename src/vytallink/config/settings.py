@@ -143,6 +143,14 @@ class Settings(BaseSettings):
     )
     disk_warning_percent: float = Field(default=90.0, validation_alias="DISK_WARNING_PERCENT")
 
+    # ---- Dashboard live video (privacy-sensitive; OFF by default) ----------
+    # When true (development only), the dashboard exposes the live camera feed.
+    # This intentionally overrides the default "no live feed" privacy posture —
+    # enable only knowingly. No footage is ever written to disk regardless.
+    dashboard_live_video: bool = Field(
+        default=False, validation_alias="DASHBOARD_LIVE_VIDEO"
+    )
+
     # ----------------------------------------------------------------------
     # Validators
     # ----------------------------------------------------------------------

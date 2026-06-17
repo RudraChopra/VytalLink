@@ -62,6 +62,18 @@ function renderHealth(h) {
 
   renderHardware(h);
 
+  // Live camera feed (opt-in; off by default). Set the stream src once.
+  const liveOn = !!h.live_video;
+  const liveCard = $("live-card");
+  if (liveCard) {
+    liveCard.hidden = !liveOn;
+    const img = $("live-img");
+    if (img) {
+      if (liveOn && !img.getAttribute("src")) img.setAttribute("src", "/api/camera/stream");
+      if (!liveOn) img.removeAttribute("src");
+    }
+  }
+
   // Warnings.
   const warnings = [];
   if (h.disk_warning) warnings.push("LOW DISK (" + (h.disk && h.disk.percent) + "%)");

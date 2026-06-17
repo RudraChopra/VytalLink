@@ -68,6 +68,17 @@
       </div>
     </section>
 
+    <!-- Live camera (opt-in; visible to anyone on this network; no footage saved) -->
+    <section class="card" id="live-card" hidden>
+      <h2>Live camera <span class="pill pill-live">LIVE</span></h2>
+      <p class="disclaimer">
+        ⚠️ This live feed is visible to <strong>anyone on this network</strong>. No
+        footage is saved. In simulation mode it shows a placeholder until a real
+        camera is connected.
+      </p>
+      <img id="live-img" class="live-img" alt="Live camera feed" />
+    </section>
+
     <!-- Vitals -->
     <section class="card">
       <h2>Wearable vitals <span id="vitals-sim" class="tag" hidden>simulated</span></h2>
