@@ -18,6 +18,9 @@ def build_dispatcher(
     settings: Settings, repos: Repositories, clock: Clock | None = None
 ) -> AlertDispatcher:
     providers: list[AlertProvider] = []
+    if not settings.alerts_enabled:
+        log.info("Alerts disabled via ALERTS_ENABLED=false; events recorded but never delivered")
+        return AlertDispatcher(providers, repos, clock=clock)
     if settings.console_alerts_enabled:
         providers.append(ConsoleAlertProvider(clock=clock))
     if settings.webhook_enabled:

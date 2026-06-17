@@ -346,6 +346,10 @@ class MonitoringService:
             return {"status": HealthStatus.UNKNOWN.value, "error": str(exc)}
 
     def _alert_health(self) -> dict[str, Any]:
+        if not self.settings.alerts_enabled:
+            # Intentionally off (e.g. during a live hardware test) — report
+            # DISABLED, not DEGRADED, so it is clearly deliberate.
+            return {"status": HealthStatus.DISABLED.value, "providers": []}
         return {
             "status": HealthStatus.OK.value if self.dispatcher.providers else HealthStatus.DEGRADED.value,
             "providers": self.dispatcher.provider_names,

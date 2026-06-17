@@ -133,6 +133,14 @@ def run_diagnostics(settings: Settings) -> list[Check]:
     # 8. Camera configuration presence
     if settings.vision_mode == VisionMode.SIMULATION:
         checks.append(Check("camera_config", PASS, "simulation (no camera required)"))
+    elif settings.vision_mode == VisionMode.HTTP_MJPEG:
+        if settings.has_camera_target:
+            checks.append(Check("camera_config", PASS,
+                                "http_mjpeg relay configured (URL/token redacted)"))
+        else:
+            checks.append(Check("camera_config", WARN if not settings.is_production else FAIL,
+                                "VISION_MODE=http_mjpeg but CAMERA_HTTP_STREAM_URL/"
+                                "CAMERA_HTTP_SNAPSHOT_URL are empty"))
     elif settings.camera_source:
         checks.append(Check("camera_config", PASS,
                             f"{settings.vision_mode.value} source configured (redacted)"))

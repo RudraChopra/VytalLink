@@ -54,6 +54,32 @@ def sanitize_url(url: str | None) -> str:
         return _CREDENTIAL_NETLOC.sub(f"{_REDACTED}@", url)
 
 
+def redact_http_endpoint(url: str | None) -> str:
+    """Reduce an HTTP(S) endpoint to ``scheme://host[:port]`` — never the full
+    URL. Path, query, fragment, and any embedded credentials are stripped.
+
+    Used for relay-camera endpoints (e.g. a Jetson MJPEG/snapshot URL) so the
+    host is identifiable in logs/health without ever exposing the full endpoint
+    URL (which can hint at internal routing) or any bearer token (the token is
+    sent only via the Authorization header and is never part of the URL). Never
+    raises; returns "" when no host can be parsed.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname or ""
+        if not host:
+            return ""
+        if ":" in host:  # IPv6 literal
+            host = f"[{host}]"
+        port = f":{parts.port}" if parts.port else ""
+        scheme = parts.scheme or "http"
+        return f"{scheme}://{host}{port}"
+    except Exception:  # pragma: no cover - never let logging crash
+        return ""
+
+
 def safe_path(path: str | Path | None) -> str:
     """Reduce a filesystem path to a credential-safe identifier.
 

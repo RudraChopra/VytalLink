@@ -20,7 +20,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from vytallink.common.errors import ConfigError
-from vytallink.common.sanitize import sanitize_secret, sanitize_url
+from vytallink.common.sanitize import redact_http_endpoint, sanitize_secret, sanitize_url
 
 # Repo root: .../src/vytallink/config/settings.py -> parents[3]
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -36,6 +36,10 @@ class VisionMode(str, Enum):
     SIMULATION = "simulation"
     FILE = "file"
     RTSP = "rtsp"
+    # An HTTP relay camera: MJPEG stream (preferred) with snapshot-polling
+    # fallback. Used to consume a remote camera-relay endpoint (e.g. a Jetson
+    # exposing the Tapo stream over HTTP) from this host.
+    HTTP_MJPEG = "http_mjpeg"
 
 
 class DetectorMode(str, Enum):
@@ -84,6 +88,13 @@ class Settings(BaseSettings):
     camera_username: str = Field(default="", validation_alias="CAMERA_USERNAME")
     camera_password: str = Field(default="", validation_alias="CAMERA_PASSWORD")
     camera_device_id: str = Field(default="camera-1", validation_alias="CAMERA_DEVICE_ID")
+    # HTTP relay camera (VISION_MODE=http_mjpeg). The full URLs are kept out of
+    # logs/health/status (only a redacted scheme://host:port is ever surfaced)
+    # and the bearer token is a secret sent ONLY via the Authorization header —
+    # it is never logged, returned, or placed in a URL.
+    camera_http_stream_url: str = Field(default="", validation_alias="CAMERA_HTTP_STREAM_URL")
+    camera_http_snapshot_url: str = Field(default="", validation_alias="CAMERA_HTTP_SNAPSHOT_URL")
+    camera_http_bearer_token: str = Field(default="", validation_alias="CAMERA_HTTP_BEARER_TOKEN")
 
     # ---- Detector / model -------------------------------------------------
     detector_mode: DetectorMode = Field(
@@ -128,6 +139,9 @@ class Settings(BaseSettings):
     wearable_sample_seconds: float = Field(default=5.0, validation_alias="WEARABLE_SAMPLE_SECONDS")
 
     # ---- Alerts -----------------------------------------------------------
+    # Master switch. When false, NO alert provider is built — events are still
+    # recorded but nothing is delivered (used e.g. during live hardware tests).
+    alerts_enabled: bool = Field(default=True, validation_alias="ALERTS_ENABLED")
     webhook_url: str = Field(default="", validation_alias="WEBHOOK_URL")
     webhook_secret: str = Field(default="", validation_alias="WEBHOOK_SECRET")
     webhook_timeout_seconds: float = Field(
@@ -235,6 +249,11 @@ class Settings(BaseSettings):
                 problems.append(
                     "VISION_MODE=file requires CAMERA_SOURCE to point at a video file."
                 )
+            if self.vision_mode == VisionMode.HTTP_MJPEG and not self.has_camera_target:
+                problems.append(
+                    "VISION_MODE=http_mjpeg requires CAMERA_HTTP_STREAM_URL (MJPEG) "
+                    "and/or CAMERA_HTTP_SNAPSHOT_URL (snapshot fallback)."
+                )
             if self.detector_mode in (DetectorMode.YOLO, DetectorMode.TENSORRT):
                 if not self.model_path:
                     problems.append(
@@ -333,12 +352,25 @@ class Settings(BaseSettings):
 
     @property
     def has_camera_target(self) -> bool:
-        """True when an RTSP target is configured (URL or host) / file path set."""
+        """True when a camera target is configured for the active vision mode."""
         if self.vision_mode == VisionMode.RTSP:
             return bool(self.camera_source.strip() or self.camera_host.strip())
+        if self.vision_mode == VisionMode.HTTP_MJPEG:
+            return bool(
+                self.camera_http_stream_url.strip() or self.camera_http_snapshot_url.strip()
+            )
         return bool(self.camera_source.strip())
 
     def sanitized_camera_source(self) -> str:
+        """A credential-/path-safe identifier for the configured camera.
+
+        For HTTP relay mode the full endpoint URL is never surfaced — only a
+        redacted ``scheme://host:port`` (no path, query, or token).
+        """
+        if self.vision_mode == VisionMode.HTTP_MJPEG:
+            return redact_http_endpoint(
+                self.camera_http_stream_url or self.camera_http_snapshot_url
+            )
         return sanitize_url(self.camera_connection_string())
 
     def safe_summary(self) -> dict[str, Any]:
@@ -354,6 +386,8 @@ class Settings(BaseSettings):
             "camera_source": self.sanitized_camera_source(),
             "camera_username": sanitize_secret(self.camera_username),
             "camera_password": sanitize_secret(self.camera_password),
+            # Presence-only — never the relay URL or the token itself.
+            "camera_http_token": sanitize_secret(self.camera_http_bearer_token),
             "detector_mode": self.detector_mode.value,
             # Basename only — the absolute model path is never logged or surfaced.
             "model_file": Path(self.model_path).name if self.model_path else "(unset)",
@@ -367,6 +401,7 @@ class Settings(BaseSettings):
             "save_event_clips": self.save_event_clips,
             "wearable_mode": self.wearable_mode.value,
             "wearable_sample_seconds": self.wearable_sample_seconds,
+            "alerts_enabled": self.alerts_enabled,
             "webhook_url": sanitize_url(self.webhook_url),
             "webhook_secret": sanitize_secret(self.webhook_secret),
             "console_alerts_enabled": self.console_alerts_enabled,

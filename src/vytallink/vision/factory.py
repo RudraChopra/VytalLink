@@ -26,6 +26,16 @@ def build_camera(settings: Settings, clock: Clock | None = None) -> CameraProvid
         from vytallink.vision.rtsp import RTSPCamera
 
         return RTSPCamera(settings.camera_connection_string(), source_id=sid, clock=clock)
+    if settings.vision_mode == VisionMode.HTTP_MJPEG:
+        from vytallink.vision.http_source import HttpCamera
+
+        return HttpCamera(
+            stream_url=settings.camera_http_stream_url,
+            snapshot_url=settings.camera_http_snapshot_url,
+            bearer_token=settings.camera_http_bearer_token,
+            source_id=sid,
+            clock=clock,
+        )
     raise ValueError(f"Unknown vision mode: {settings.vision_mode}")  # pragma: no cover
 
 
