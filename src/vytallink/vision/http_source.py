@@ -97,6 +97,9 @@ class HttpCamera(CameraProvider):
         chunk_size: int = 8192,
         **kw: Any,
     ) -> None:
+        # A relay reconnect is cheap on a LAN; cap backoff low so a flapping/
+        # stalled link recovers in seconds rather than up to 30s (overridable).
+        kw.setdefault("max_backoff", 5.0)
         super().__init__(source_id, **kw)
         self._stream_url = (stream_url or "").strip()
         self._snapshot_url = (snapshot_url or "").strip()
@@ -385,6 +388,12 @@ class HttpCamera(CameraProvider):
     def health(self) -> dict[str, Any]:
         h = super().health()
         thread = self._grab_thread
+        # Frame freshness for a buffered camera is the GRAB age, not the consumer
+        # read age (which inflates during reconnects even while frames flow).
+        grab = self._last_grab_mono
+        h["last_frame_age_seconds"] = (
+            None if grab is None else round(self.clock.monotonic() - grab, 2)
+        )
         h.update(
             {
                 "safe_source": self.safe_source,

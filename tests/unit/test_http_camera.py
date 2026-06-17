@@ -237,3 +237,25 @@ def test_settings_http_mode_redacts_url_and_token():
 def test_settings_http_token_absent_is_empty_redaction():
     s = load_settings(vision_mode="http_mjpeg", camera_http_stream_url=STREAM)
     assert s.safe_summary()["camera_http_token"] == ""
+
+
+# --- frame-age is grab-based (regression: soak showed inflated read-based age) --
+def test_frame_age_is_grab_based_not_read_based():
+    """Health frame age must reflect GRAB freshness, not consumer read cadence,
+    so it is not inflated during reconnects while frames are still flowing."""
+    clock = ManualClock()
+    cam = _ScriptedHttpCamera([_jpeg(), _jpeg()], clock)
+    cam.open()
+    cam._grab_once()
+    clock.advance(2.0)  # time passes; no read() call at all
+    assert cam.health()["last_frame_age_seconds"] == pytest.approx(2.0, abs=0.01)
+    cam._grab_once()    # a fresh grab resets the age
+    assert cam.health()["last_frame_age_seconds"] == pytest.approx(0.0, abs=0.01)
+    cam.close()
+
+
+def test_http_reconnect_backoff_is_bounded_low_for_lan():
+    """A relay reconnect is cheap on a LAN; backoff is capped low so a flapping
+    link recovers in seconds (overridable)."""
+    assert HttpCamera(stream_url=STREAM).max_backoff <= 5.0
+    assert HttpCamera(stream_url=STREAM, max_backoff=2.0).max_backoff == 2.0

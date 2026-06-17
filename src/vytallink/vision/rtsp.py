@@ -282,6 +282,12 @@ class RTSPCamera(CameraProvider):
     def health(self) -> dict[str, Any]:
         h = super().health()
         thread = self._grab_thread
+        # Grab-based freshness (see HttpCamera.health) — independent of consumer
+        # read cadence so it is not inflated during reconnects.
+        grab = self._last_grab_mono
+        h["last_frame_age_seconds"] = (
+            None if grab is None else round(self.clock.monotonic() - grab, 2)
+        )
         h.update(
             {
                 "safe_source": self.safe_source,

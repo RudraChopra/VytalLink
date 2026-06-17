@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
@@ -102,6 +103,12 @@ class MonitoringService:
         self._last_inference_time: datetime | None = None
         self._last_vital: VitalRow | None = None
         self._sim_lock = asyncio.Lock()
+        # Single dedicated thread for ALL accelerator work (model load, warmup,
+        # every inference). MPS/Metal command buffers are not safe across threads;
+        # asyncio.to_thread's multi-worker pool intermittently aborts the process
+        # with a Metal "scheduled handler after commit" assertion. Created in
+        # start(); inference is pinned here so it never crosses threads.
+        self._infer_executor: ThreadPoolExecutor | None = None
         # Latest decoded camera frame (BGR ndarray) the DETECTOR last processed —
         # used for the annotated preview (boxes align with this frame). The raw
         # live feed serves the camera's freshest frame directly (see
@@ -128,7 +135,14 @@ class MonitoringService:
             return
         self.settings.ensure_runtime_dirs()
         self.db.initialize()
-        self.detector.load()
+        # Pin model load + warmup to the dedicated inference thread so every later
+        # inference runs on the SAME thread (MPS/Metal thread-affinity).
+        self._infer_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vytallink-infer"
+        )
+        await asyncio.get_running_loop().run_in_executor(
+            self._infer_executor, self.detector.load
+        )
         self._register_devices()
 
         try:
@@ -176,6 +190,9 @@ class MonitoringService:
         self.wearable.disconnect()
         await self.dispatcher.aclose()
         self.db.close()
+        if self._infer_executor is not None:
+            self._infer_executor.shutdown(wait=False)
+            self._infer_executor = None
         log.info("MonitoringService stopped")
 
     # -- device registration ----------------------------------------------
@@ -422,9 +439,14 @@ class MonitoringService:
 
     async def _detect_and_observe_once(self) -> None:
         # Camera read + model inference are blocking native calls (cv2 / torch).
-        # Offload to a worker thread so a slow source can never freeze the event
-        # loop (and thus the API). observe() + transition recording stay on loop.
-        result = await asyncio.to_thread(self._detect_once_live)
+        # Run on the SINGLE dedicated inference thread (not asyncio.to_thread's
+        # multi-worker pool) so MPS/Metal work never crosses threads. A slow
+        # source still cannot freeze the event loop; observe() + transition
+        # recording stay on the loop.
+        executor = self._infer_executor
+        result = await asyncio.get_running_loop().run_in_executor(
+            executor, self._detect_once_live
+        )
         if result is None:
             return  # no new fresh frame this tick
         evidence, confidence = result

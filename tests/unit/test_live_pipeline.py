@@ -243,6 +243,37 @@ def test_relay_settings_validation():
 
 # --- frames flow into the event pipeline (alerts disabled) ------------------
 @pytest.mark.asyncio
+async def test_inference_pinned_to_single_dedicated_thread(tmp_path):
+    """Regression: MPS/Metal is not thread-safe across threads. Every inference
+    must run on ONE dedicated off-loop thread (asyncio.to_thread's multi-worker
+    pool intermittently aborts with a Metal command-buffer assertion)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    svc = build_live_service(tmp_path, dets=[_det("standing", 0.8)],
+                             detect_max_frame_age_seconds=10.0)
+    svc._infer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vytallink-infer")
+    seen: list[str] = []
+    base_infer = svc.detector.infer
+
+    def recording(frame):
+        seen.append(threading.current_thread().name)
+        return base_infer(frame)
+
+    svc.detector.infer = recording
+    main_thread = threading.current_thread().name
+    for i in range(1, 6):
+        svc.camera.set_peek(_img(), seq=i, age=0.0)
+        await svc._detect_and_observe_once()
+    svc._infer_executor.shutdown(wait=True)
+
+    assert len(seen) == 5
+    assert all(name == seen[0] for name in seen)   # always the same thread
+    assert seen[0] != main_thread                  # never the event-loop thread
+    assert "vytallink-infer" in seen[0]            # the dedicated executor thread
+
+
+@pytest.mark.asyncio
 async def test_fresh_frames_confirm_event_with_alerts_disabled(tmp_path):
     evclk = ManualClock()
     svc = build_live_service(
