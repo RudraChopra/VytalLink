@@ -24,28 +24,43 @@ except Exception:  # pragma: no cover - psutil expected present
 
 @lru_cache(maxsize=1)
 def gpu_info() -> dict[str, Any]:
-    """Detect GPU/CUDA availability for inference. Cached for the process.
+    """Detect the inference accelerator (CUDA, Apple MPS, or CPU). Cached.
 
-    On this Jetson the system PyTorch is the CPU-only build, so CUDA reports
-    unavailable until the Jetson CUDA wheel is installed (see hardware docs).
+    ``available`` reports CUDA specifically (back-compat with the Jetson path);
+    ``selected_device`` reports what inference actually runs on after probing
+    CUDA → MPS → CPU (see :mod:`vytallink.common.device`). On the Jetson the
+    system PyTorch is CPU-only until the CUDA wheel is installed; on Apple
+    silicon MPS is selected. Only device strings / flags are surfaced — no
+    paths or host-private info.
     """
+    from vytallink.common.device import device_report
+
     info: dict[str, Any] = {"available": False, "detail": "not probed", "framework": None}
     try:
         import torch  # noqa: WPS433 (heavy, hence cached)
 
-        available = bool(torch.cuda.is_available())
+        rpt = device_report()
+        cuda = rpt["cuda_available"]
+        mps = rpt["mps_available"]
+        selected = rpt["selected_device"]
+        if cuda:
+            detail = "CUDA available"
+        elif mps:
+            detail = "Apple MPS available (CUDA unavailable)"
+        else:
+            detail = "torch present but no GPU accelerator (using CPU)"
         info.update(
-            available=available,
+            available=cuda,
             framework="torch",
             torch_version=getattr(torch, "__version__", "?"),
             cuda_build=getattr(getattr(torch, "version", None), "cuda", None),
-            detail=(
-                "CUDA available"
-                if available
-                else "torch present but CUDA unavailable (CPU-only build)"
-            ),
+            cuda_available=cuda,
+            mps_available=mps,
+            mps_built=rpt["mps_built"],
+            selected_device=selected,
+            detail=detail,
         )
-        if available:
+        if cuda:
             info["device_count"] = torch.cuda.device_count()
             try:
                 info["device_name"] = torch.cuda.get_device_name(0)

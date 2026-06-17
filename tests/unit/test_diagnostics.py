@@ -18,7 +18,7 @@ def test_diagnostics_no_failures_in_simulation(tmp_path):
     names = {c.name for c in checks}
     assert {
         "environment", "python_env", "imports", "configuration", "database",
-        "port", "gpu", "camera_config", "model_config", "wearable", "disk",
+        "port", "inference_device", "camera_config", "model_config", "wearable", "disk",
     } <= names
     # No hard failures expected for a default simulation configuration.
     failures = [c for c in checks if c.status == FAIL]

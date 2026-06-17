@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from vytallink.common.errors import ConfigError
+from vytallink.common.sanitize import safe_path
 from vytallink.config import DetectorMode, Settings, VisionMode, get_settings
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
@@ -42,13 +43,14 @@ def _port_free(host: str, port: int) -> bool:
 def run_diagnostics(settings: Settings) -> list[Check]:
     checks: list[Check] = []
 
-    # 1. Environment
+    # 1. Environment (OS, architecture, Python — portable across Linux/macOS)
     py = sys.version_info
     checks.append(
         Check(
             "environment",
             PASS if py >= (3, 10) else WARN,
-            f"Python {py.major}.{py.minor}.{py.micro} on {platform.machine()} / {platform.system()}",
+            f"{platform.system()} {platform.machine()} | Python "
+            f"{py.major}.{py.minor}.{py.micro}",
         )
     )
 
@@ -88,9 +90,11 @@ def run_diagnostics(settings: Settings) -> list[Check]:
         health = db.health()
         db.close()
         ok = bool(health.get("ok"))
+        # Filename only — never the absolute DB path (it embeds the home dir).
         checks.append(
             Check("database", PASS if ok else FAIL,
-                  f"schema v{version} at {settings.database_path} (writable={health.get('writable')})")
+                  f"schema v{version} ({safe_path(settings.database_path)}, "
+                  f"writable={health.get('writable')})")
         )
     except Exception as exc:  # noqa: BLE001
         checks.append(Check("database", FAIL, f"{type(exc).__name__}: {exc}"))
@@ -103,21 +107,28 @@ def run_diagnostics(settings: Settings) -> list[Check]:
               else f"{settings.host}:{settings.port} in use (app already running?)")
     )
 
-    # 7. GPU visibility
+    # 7. Inference device (CUDA / Apple MPS / CPU) + Torch
     try:
         from vytallink.monitoring import system_info
 
         gpu = system_info.gpu_info()
-        if gpu.get("available"):
-            checks.append(Check("gpu", PASS, gpu.get("detail", "CUDA available")))
+        selected = gpu.get("selected_device", "cpu")
+        summary = (
+            f"torch {gpu.get('torch_version')} | "
+            f"cuda={gpu.get('cuda_available', gpu.get('available'))} "
+            f"mps={gpu.get('mps_available')} | device={selected}"
+        )
+        if selected and selected != "cpu":
+            # A real accelerator (CUDA or MPS) was selected and probed OK.
+            checks.append(Check("inference_device", PASS, summary))
         else:
             checks.append(
-                Check("gpu", WARN,
-                      f"{gpu.get('detail')} — not required for Phase 1 simulation; "
-                      "install the Jetson CUDA PyTorch wheel before real inference")
+                Check("inference_device", WARN,
+                      f"{summary} — CPU inference (fine for Phase 1 simulation; "
+                      "install the Jetson CUDA wheel or run on Apple silicon for GPU)")
             )
     except Exception as exc:  # noqa: BLE001
-        checks.append(Check("gpu", WARN, f"probe failed: {exc}"))
+        checks.append(Check("inference_device", WARN, f"probe failed: {type(exc).__name__}: {exc}"))
 
     # 8. Camera configuration presence
     if settings.vision_mode == VisionMode.SIMULATION:
@@ -133,7 +144,8 @@ def run_diagnostics(settings: Settings) -> list[Check]:
     if settings.detector_mode == DetectorMode.SIMULATION:
         checks.append(Check("model_config", PASS, "simulation detector (no model required)"))
     elif settings.model_path and Path(settings.model_path).expanduser().exists():
-        checks.append(Check("model_config", PASS, f"model present at {settings.model_path}"))
+        # Filename only — never the absolute model path.
+        checks.append(Check("model_config", PASS, f"model present ({safe_path(settings.model_path)})"))
     else:
         checks.append(Check("model_config", WARN if not settings.is_production else FAIL,
                             f"DETECTOR_MODE={settings.detector_mode.value} but MODEL_PATH missing/not found"))

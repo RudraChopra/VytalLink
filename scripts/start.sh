@@ -61,7 +61,18 @@ fi
 
 echo "==> VytalLink is running (PID $APP_PID)."
 echo "    Local:   http://127.0.0.1:${PORT}"
-LAN_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(192|10|172)\.' | head -1 || true)"
+# LAN IP for the address banner — portable across Linux (Jetson) and macOS.
+LAN_IP=""
+if hostname -I >/dev/null 2>&1; then
+  # Linux: `hostname -I` lists all interface addresses.
+  LAN_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(192|10|172)\.' | head -1 || true)"
+elif command -v ipconfig >/dev/null 2>&1; then
+  # macOS: `hostname -I` is unsupported; query common Wi-Fi/Ethernet interfaces.
+  for iface in en0 en1 en2; do
+    ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+    if [[ -n "${ip}" ]]; then LAN_IP="${ip}"; break; fi
+  done
+fi
 if [[ -n "${LAN_IP}" ]]; then
   echo "    Network: http://${LAN_IP}:${PORT}  (same Wi-Fi/LAN)"
 fi

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from vytallink.common.clock import Clock, SystemClock
+from vytallink.common.device import CPU_DEVICE, MPS_DEVICE, select_device, synchronize_device
 from vytallink.common.errors import DetectorError
 from vytallink.common.logging_setup import get_logger
 from vytallink.common.types import Frame, HealthStatus, RawDetection
@@ -80,6 +81,10 @@ class YoloFallDetector(FallDetector):
         #: Whether the most recent inference call succeeded. Drives runtime health
         #: so a model that loaded once but fails every frame is reported DEGRADED.
         self.last_infer_ok: bool = True
+        #: Set when an op was unsupported on the selected accelerator (e.g. MPS)
+        #: and the detector fell back to CPU. Surfaced so we never *silently*
+        #: claim the accelerator was used.
+        self.mps_fallback_reason: str | None = None
 
     # -- lifecycle ---------------------------------------------------------
     @property
@@ -87,21 +92,15 @@ class YoloFallDetector(FallDetector):
         return self._model is not None
 
     def _resolve_device(self) -> tuple[str, bool]:
-        if self._device_pref:
-            dev = self._device_pref
-            cuda = dev.startswith("cuda")
-        else:
-            try:
-                import torch  # noqa: WPS433
-
-                cuda = bool(torch.cuda.is_available())
-            except Exception:  # pragma: no cover - torch always present here
-                cuda = False
-            dev = "cuda:0" if cuda else "cpu"
+        # Single source of truth (common.device): probes CUDA → MPS → CPU and
+        # falls back safely if a backend is present but not actually usable.
+        dev = select_device(self._device_pref)
+        cuda = dev.startswith("cuda")
         # NOTE: fp16 is OFF by default. On this Jetson (cuDNN 8.6 + torch 2.3)
         # several YOLO11 conv plans raise CUDNN_STATUS_NOT_SUPPORTED in half
         # precision and fall back to a slow path (~700 ms/frame vs ~35 ms fp32).
         # Enable explicitly (DETECTOR_HALF) only if a future cuDNN supports it.
+        # half is CUDA-only (MPS uses fp32 here).
         half = bool(self._half_pref) and cuda
         return dev, half
 
@@ -132,10 +131,7 @@ class YoloFallDetector(FallDetector):
             raise DetectorError(f"Failed to load YOLO model: {type(exc).__name__}: {exc}") from exc
 
         if self._warmup:
-            try:
-                self.warmup_ms = self._run_warmup()
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("YOLO warmup failed (continuing): %s", type(exc).__name__)
+            self._warmup_with_fallback()
 
         log.info(
             "YOLO model '%s' loaded: task=%s classes=%s device=%s half=%s warmup=%sms",
@@ -147,23 +143,59 @@ class YoloFallDetector(FallDetector):
             round(self.warmup_ms, 1) if self.warmup_ms is not None else "n/a",
         )
 
+    def _warmup_with_fallback(self) -> None:
+        """Warm the model up once. If the selected accelerator (e.g. MPS) hits an
+        unsupported op, fall back to CPU and warm up there — never crash load."""
+        try:
+            self.warmup_ms = self._run_warmup()
+        except Exception as exc:
+            if self._maybe_fallback_to_cpu(exc):
+                try:
+                    self.warmup_ms = self._run_warmup()
+                except Exception as exc2:  # pragma: no cover - defensive
+                    log.warning("CPU warmup after fallback failed: %s", type(exc2).__name__)
+            else:  # pragma: no cover - defensive
+                log.warning("YOLO warmup failed (continuing): %s", type(exc).__name__)
+
+    def _maybe_fallback_to_cpu(self, exc: Exception) -> bool:
+        """If running on an accelerator (MPS) and an op is unsupported, move the
+        model to CPU and record the exact error. Returns True if it fell back.
+
+        We never *silently* claim the accelerator: ``device_str`` becomes ``cpu``
+        and ``mps_fallback_reason`` carries the original error for diagnostics.
+        """
+        if self.device_str != MPS_DEVICE:
+            return False
+        self.mps_fallback_reason = f"{type(exc).__name__}: {exc}"
+        log.warning(
+            "MPS op unsupported (%s); falling back to CPU for inference",
+            self.mps_fallback_reason,
+        )
+        try:
+            self._model.to(CPU_DEVICE)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        self.device_str = CPU_DEVICE
+        self.half = False
+        return True
+
     def _run_warmup(self) -> float:
         import numpy as np  # noqa: WPS433
 
         blank = np.zeros((self.image_size, self.image_size, 3), dtype="uint8")
         t0 = time.perf_counter()
         self._predict(blank)
-        self._cuda_sync()
+        self._device_sync()
         return (time.perf_counter() - t0) * 1000.0
 
-    def _cuda_sync(self) -> None:
-        if self.device_str.startswith("cuda"):
-            try:
-                import torch  # noqa: WPS433
+    def _device_sync(self) -> None:
+        """Synchronize the active accelerator (CUDA/MPS) before reading a timer."""
+        try:
+            import torch  # noqa: WPS433
 
-                torch.cuda.synchronize()
-            except Exception:  # pragma: no cover - defensive
-                pass
+            synchronize_device(torch, self.device_str)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _predict(self, image: Any) -> Any:
         return self._model.predict(
@@ -173,6 +205,10 @@ class YoloFallDetector(FallDetector):
             device=self.device_str,
             half=self.half,
             verbose=False,
+            # Never write annotated frames / labels to runs/ (footage off-disk).
+            save=False,
+            save_txt=False,
+            save_conf=False,
         )
 
     # -- inference ---------------------------------------------------------
@@ -186,12 +222,25 @@ class YoloFallDetector(FallDetector):
         t0 = time.perf_counter()
         try:
             results = self._predict(frame.image)
-            self._cuda_sync()
+            self._device_sync()
         except Exception as exc:
-            self._last_error = f"{type(exc).__name__}: {exc}"
-            self.last_infer_ok = False
-            log.warning("YOLO inference failed: %s", self._last_error)
-            return []
+            # An unsupported MPS op surfaces here on the first real frame: fall
+            # back to CPU and retry once so a fall is never missed mid-stream.
+            if self._maybe_fallback_to_cpu(exc):
+                try:
+                    t0 = time.perf_counter()
+                    results = self._predict(frame.image)
+                    self._device_sync()
+                except Exception as exc2:
+                    self._last_error = f"{type(exc2).__name__}: {exc2}"
+                    self.last_infer_ok = False
+                    log.warning("YOLO inference failed after CPU fallback: %s", self._last_error)
+                    return []
+            else:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self.last_infer_ok = False
+                log.warning("YOLO inference failed: %s", self._last_error)
+                return []
         self._record_latency((time.perf_counter() - t0) * 1000.0)
         self.last_infer_ok = True
         self._last_error = None
@@ -311,6 +360,8 @@ class YoloFallDetector(FallDetector):
             "classes": list(self.class_names.values()),
             "device": self.device_str,
             "cuda": self.device_str.startswith("cuda"),
+            "mps": self.device_str == MPS_DEVICE,
+            "mps_fallback": self.mps_fallback_reason,
             "half": self.half,
             "image_size": self.image_size,
             "confidence_threshold": self.confidence,

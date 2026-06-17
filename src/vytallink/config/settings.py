@@ -347,7 +347,8 @@ class Settings(BaseSettings):
             "env": self.env.value,
             "host": self.host,
             "port": self.port,
-            "database_path": str(self.database_path),
+            # Filename only — never the absolute DB path (it embeds the home dir).
+            "database_file": Path(self.database_path).name,
             "log_level": self.log_level,
             "vision_mode": self.vision_mode.value,
             "camera_source": self.sanitized_camera_source(),

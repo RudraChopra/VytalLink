@@ -33,16 +33,23 @@ class FakeYoloModel:
         self._script: list[list[tuple[int, float]]] = []
         self._idx = 0
         self.predict_calls = 0
+        #: kwargs from the most recent predict() call (lets tests assert the
+        #: adapter requests save=False so nothing is written to runs/).
+        self.last_kwargs: dict[str, Any] = {}
+        #: devices the model has been moved to via .to() (for fallback tests).
+        self.moved_to: list[str] = []
 
     def set_script(self, frames: list[list[tuple[int, float]]]) -> None:
         self._script = frames
         self._idx = 0
 
     def to(self, device: str) -> "FakeYoloModel":
+        self.moved_to.append(device)
         return self
 
     def predict(self, image: Any, **kw: Any) -> list[_Result]:
         self.predict_calls += 1
+        self.last_kwargs = dict(kw)
         if self._script:
             spec = self._script[min(self._idx, len(self._script) - 1)]
             self._idx += 1

@@ -87,6 +87,9 @@ logs/*
 *.pid
 run/
 
+# Ultralytics prediction/run outputs (footage; never commit)
+runs/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

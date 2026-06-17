@@ -128,3 +128,75 @@ def test_health_degrades_when_inference_fails_then_recovers():
     assert det.last_infer_ok is True
     assert det.health()["status"] == "ok"
     assert det.health()["last_error"] is None
+
+
+# --- device selection wiring ----------------------------------------------
+def test_detector_receives_selected_device_mps(monkeypatch):
+    """The detector must take its device from common.device.select_device, not
+    re-implement detection. MPS runs fp32 (half is CUDA-only)."""
+    from vytallink.vision import detector_yolo
+
+    monkeypatch.setattr(detector_yolo, "select_device", lambda pref: "mps")
+    det = YoloFallDetector("/fake/m.pt", warmup=False, half=True)
+    device, half = det._resolve_device()
+    assert device == "mps"
+    assert half is False
+
+
+def test_detector_receives_selected_device_cuda_with_half(monkeypatch):
+    from vytallink.vision import detector_yolo
+
+    monkeypatch.setattr(detector_yolo, "select_device", lambda pref: "cuda:0")
+    det = YoloFallDetector("/fake/m.pt", warmup=False, half=True)
+    device, half = det._resolve_device()
+    assert device == "cuda:0"
+    assert half is True
+
+
+def test_detector_receives_selected_device_cpu(monkeypatch):
+    from vytallink.vision import detector_yolo
+
+    monkeypatch.setattr(detector_yolo, "select_device", lambda pref: "cpu")
+    det = YoloFallDetector("/fake/m.pt", warmup=False, half=True)
+    device, half = det._resolve_device()
+    assert device == "cpu"
+    assert half is False
+
+
+def test_inference_writes_no_runs_dir(tmp_path, monkeypatch):
+    """Inference must never create an Ultralytics runs/ output dir; the adapter
+    must request save=False / save_txt=False."""
+    monkeypatch.chdir(tmp_path)
+    clock = ManualClock()
+    det = make_yolo_detector(clock, require_transition=False)
+    det._model.set_script([[(2, 0.9)]])
+    det.infer(_frame(1, clock))
+    kw = det._model.last_kwargs
+    assert kw.get("save") is False
+    assert kw.get("save_txt") is False
+    assert not (tmp_path / "runs").exists()
+
+
+def test_mps_inference_failure_falls_back_to_cpu(monkeypatch):
+    """An unsupported op on MPS must fall back to CPU at inference time, switch
+    device_str to cpu, and record the reason (never silently claim MPS)."""
+    clock = ManualClock()
+    det = make_yolo_detector(clock, require_transition=False)
+    det.device_str = "mps"  # pretend we selected MPS
+    calls = {"n": 0}
+    real_predict = det._model.predict
+
+    def flaky(image, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise NotImplementedError("aten::xxx not implemented for MPS")
+        return real_predict(image, **kw)
+
+    det._model.predict = flaky
+    det._model.set_script([[(0, 0.9)]])
+    dets = det.infer(_frame(1, clock))
+    assert det.device_str == "cpu"  # fell back
+    assert det.mps_fallback_reason is not None
+    assert "MPS" in det.mps_fallback_reason
+    assert det.health()["mps_fallback"] is not None
+    assert dets and dets[0].class_name == "fallen"  # retry on CPU succeeded
