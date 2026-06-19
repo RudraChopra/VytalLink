@@ -141,3 +141,70 @@ def test_camera_connection_embeds_credentials_but_summary_hides():
     # ...but the sanitized form (used for logs/health) is redacted.
     assert "bob" not in s.sanitized_camera_source()
     assert "pw" not in s.sanitized_camera_source()
+
+
+# --- one Tapo RTSP camera: component-based config (CAMERA_HOST/PORT/PATH) ---
+def test_tapo_rtsp_url_assembled_from_components():
+    """A Tapo camera is configured from discrete fields (no full CAMERA_SOURCE).
+    The assembled URL must embed creds and the stream path correctly."""
+    s = load_settings(
+        vision_mode="rtsp",
+        camera_host="192.168.1.71",
+        camera_port=554,
+        camera_stream_path="stream1",  # leading slash optional
+        camera_username="vyt",
+        camera_password="secretpw",
+    )
+    assert s.camera_connection_string() == "rtsp://vyt:secretpw@192.168.1.71:554/stream1"
+    assert s.has_camera_target is True
+
+
+def test_tapo_rtsp_password_special_chars_encoded_and_redacted():
+    """A password with RTSP-significant characters must be URL-encoded in the
+    connection string yet fully redacted everywhere it is surfaced."""
+    s = load_settings(
+        vision_mode="rtsp",
+        camera_host="192.168.1.71",
+        camera_stream_path="/stream1",
+        camera_username="vyt",
+        camera_password="p@ss:w/d",
+    )
+    conn = s.camera_connection_string()
+    # Encoded so the URL stays well-formed (@ -> %40, : -> %3A, / -> %2F).
+    assert "p%40ss%3Aw%2Fd" in conn
+    assert "p@ss:w/d" not in conn
+    # Redacted in every public/log surface.
+    redacted = s.sanitized_camera_source()
+    assert "p@ss" not in redacted and "p%40ss" not in redacted
+    assert "vyt" not in redacted
+    assert redacted == "rtsp://***REDACTED***@192.168.1.71:554/stream1"
+    blob = str(s.safe_summary())
+    assert "p@ss" not in blob and "p%40ss" not in blob
+    assert s.safe_summary()["camera_password"] == "***REDACTED***"
+
+
+def test_tapo_rtsp_camera_redacts_credentials_in_provider():
+    """The actual camera provider (reused pipeline) must never expose creds in
+    its safe_source or health."""
+    from vytallink.vision.rtsp import RTSPCamera
+
+    s = load_settings(
+        vision_mode="rtsp",
+        camera_host="192.168.1.71",
+        camera_stream_path="/stream1",
+        camera_username="vyt",
+        camera_password="secretpw",
+    )
+    cam = RTSPCamera(s.camera_connection_string(), source_id=s.camera_device_id)
+    assert "secretpw" not in cam.safe_source and "vyt" not in cam.safe_source
+    assert "192.168.1.71:554" in cam.safe_source
+    assert "secretpw" not in str(cam.health())
+
+
+def test_committed_defaults_keep_rtsp_disabled():
+    """Regression for the live-test work: the default (committed) config must
+    stay in simulation so RTSP is never enabled by accident."""
+    s = load_settings()
+    assert s.vision_mode == VisionMode.SIMULATION
+    assert s.detector_mode == DetectorMode.SIMULATION
+    assert s.has_camera_target is False
