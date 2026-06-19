@@ -163,13 +163,16 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n(interrupted)")
     finally:
+        # Snapshot health BEFORE closing so the summary reflects the live run,
+        # not the post-close "down" state.
+        ch = camera.health()
         camera.close()
         detector.close()
 
     elapsed = max(1e-6, time.monotonic() - start)
-    ch = camera.health()
-    capture_fps = round(frames / elapsed, 2)
-    inference_fps = round(processed / elapsed, 2)  # full pipeline throughput
+    read_poll_fps = round(frames / elapsed, 2)        # how often we polled read()
+    capture_fps = ch.get("effective_fps")             # UNIQUE frames/s from the camera
+    process_fps = round(processed / elapsed, 2)       # inference invocations/s
     conn_status = ch.get("status") if frames else "down"
     class_summary = ", ".join(f"{k}={v}" for k, v in class_counts.most_common()) or "none"
 
@@ -177,13 +180,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"camera connection : {conn_status}  (source {camera.safe_source})")
     print(f"selected device   : {detector.device_str}")
     print(f"resolution        : {ch.get('resolution')}")
-    print(f"frames received   : {frames}")
-    print(f"frames processed  : {processed}  (every {every}th frame)")
+    # read() returns the latest buffered frame on every poll, so polls >> unique
+    # frames; capture FPS is the camera's true unique-frame rate (effective_fps).
+    print(f"read() polls      : {frames}  ({read_poll_fps}/s)")
+    print(f"frames processed  : {processed}  (every {every}th poll)")
     print(f"failed reads      : {failed}")
-    print(f"capture FPS       : {capture_fps}  (camera effective_fps={ch.get('effective_fps')})")
-    print(f"inference FPS     : {detector.inference_fps()}")
-    print(f"end-to-end FPS    : {inference_fps}  (processed frames / wall time)")
-    print(f"avg inference ms  : {round(detector.avg_inference_ms, 2) if detector.avg_inference_ms else None}")
+    print(f"capture FPS       : {capture_fps}  (unique frames/s from camera)")
+    print(f"inference FPS     : {detector.inference_fps()}  (rolling)")
+    print(f"inference latency : avg {round(detector.avg_inference_ms, 2) if detector.avg_inference_ms else None} ms"
+          f"  (last {detector.last_inference_ms} ms)")
+    print(f"end-to-end FPS    : {process_fps}  (inference invocations/s; "
+          f"capped in practice by the {capture_fps} fps camera)")
     print(f"dropped frames    : {ch.get('frames_dropped')}  (intentional: latest-frame)")
     print(f"reconnects        : {ch.get('reconnects')}")
     if detector.mps_fallback_reason:
