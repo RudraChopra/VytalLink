@@ -15,15 +15,21 @@ log = get_logger("alerts.factory")
 
 
 def build_dispatcher(
-    settings: Settings, repos: Repositories, clock: Clock | None = None
+    settings: Settings, repos: Repositories, clock: Clock | None = None, *, dry_run: bool = False
 ) -> AlertDispatcher:
+    """Assemble the alert dispatcher.
+
+    ``dry_run`` (set when synthetic fall testing is active) SUPPRESSES external
+    delivery — the webhook provider is not built — so a synthetic/forced fall can
+    never page a real caregiver. Console alerts (local log lines) still fire.
+    """
     providers: list[AlertProvider] = []
     if not settings.alerts_enabled:
         log.info("Alerts disabled via ALERTS_ENABLED=false; events recorded but never delivered")
         return AlertDispatcher(providers, repos, clock=clock)
     if settings.console_alerts_enabled:
         providers.append(ConsoleAlertProvider(clock=clock))
-    if settings.webhook_enabled:
+    if settings.webhook_enabled and not dry_run:
         providers.append(
             WebhookAlertProvider(
                 settings.webhook_url,
@@ -32,6 +38,8 @@ def build_dispatcher(
                 clock=clock,
             )
         )
+    elif settings.webhook_enabled and dry_run:
+        log.warning("DRY-RUN (synthetic fall testing): external webhook alert delivery is SUPPRESSED")
     if not providers:
         log.warning("No alert providers enabled; alerts will be recorded but not delivered")
     return AlertDispatcher(providers, repos, clock=clock)

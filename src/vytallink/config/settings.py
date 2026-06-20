@@ -23,6 +23,11 @@ from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from vytallink.common.errors import ConfigError
+
+#: Postures the fall model emits that are NOT falls. If any appear in
+#: FALL_CLASS_NAMES, the detector is treating a normal posture as a fall — i.e.
+#: synthetic test mode (safety-gated; see Settings.synthetic_detection_active).
+_SYNTHETIC_POSTURE_CLASSES = frozenset({"sitting", "standing", "upright", "seated", "person"})
 from vytallink.common.sanitize import redact_http_endpoint, sanitize_secret, sanitize_url
 
 # Repo root: .../src/vytallink/config/settings.py -> parents[3]
@@ -176,6 +181,20 @@ class Settings(BaseSettings):
     )
     console_alerts_enabled: bool = Field(
         default=True, validation_alias="CONSOLE_ALERTS_ENABLED"
+    )
+
+    # ---- Synthetic fall testing (DEV-ONLY, safety-gated) ------------------
+    # Treating a non-fall posture as fall evidence (e.g. FALL_CLASS_NAMES that
+    # includes 'sitting'/'standing', or SYNTHETIC_FALL_TEST_MODE=true) forces the
+    # live pipeline to "confirm" falls for validation. This is UNSAFE to leave on:
+    # it must be explicitly allowed, NEVER runs in production (fails closed), and
+    # when active alerts are forced to dry-run and events are persisted as
+    # event_type='fall_synthetic'. Committed defaults keep it OFF.
+    allow_synthetic_fall_testing: bool = Field(
+        default=False, validation_alias="ALLOW_SYNTHETIC_FALL_TESTING"
+    )
+    synthetic_fall_test_mode: bool = Field(
+        default=False, validation_alias="SYNTHETIC_FALL_TEST_MODE"
     )
 
     # ---- Monitoring loop --------------------------------------------------
@@ -345,6 +364,23 @@ class Settings(BaseSettings):
             # Allowed (instant confirm/clear in tests) but warn-worthy; not fatal.
             pass
 
+        # Synthetic fall testing fails CLOSED: never in production, and only with
+        # an explicit opt-in elsewhere. This stops an unsafe FALL_CLASS_NAMES
+        # override (e.g. 'sitting'/'standing') from silently shipping.
+        if self.synthetic_detection_active:
+            if self.is_production:
+                problems.append(
+                    "Synthetic fall testing (SYNTHETIC_FALL_TEST_MODE, or a non-fall "
+                    "posture such as 'sitting'/'standing' in FALL_CLASS_NAMES) is NOT "
+                    "permitted in production."
+                )
+            elif not self.allow_synthetic_fall_testing:
+                problems.append(
+                    "Synthetic fall detection is active (SYNTHETIC_FALL_TEST_MODE, or a "
+                    "non-fall posture in FALL_CLASS_NAMES) but ALLOW_SYNTHETIC_FALL_TESTING "
+                    "is false. Set ALLOW_SYNTHETIC_FALL_TESTING=true to permit it (dev only)."
+                )
+
         if problems:
             joined = "\n  - ".join(problems)
             raise ConfigError(
@@ -375,6 +411,18 @@ class Settings(BaseSettings):
     @property
     def fall_class_set(self) -> set[str]:
         return {c.strip().lower() for c in self.fall_class_names.split(",") if c.strip()}
+
+    @property
+    def synthetic_override_in_fall_classes(self) -> bool:
+        """True when FALL_CLASS_NAMES treats a non-fall posture as fall evidence."""
+        return bool(self.fall_class_set & _SYNTHETIC_POSTURE_CLASSES)
+
+    @property
+    def synthetic_detection_active(self) -> bool:
+        """True when the detector is (deliberately) treating non-falls as falls —
+        an explicit SYNTHETIC_FALL_TEST_MODE flag or a posture override in
+        FALL_CLASS_NAMES. Gated/validated in :meth:`_validate_cross_field`."""
+        return bool(self.synthetic_fall_test_mode or self.synthetic_override_in_fall_classes)
 
     @property
     def webhook_enabled(self) -> bool:

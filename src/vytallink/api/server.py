@@ -167,12 +167,25 @@ def _register_routes(app: FastAPI) -> None:
         devices = _svc(request).repos.devices.list()
         return {"items": [device_to_dict(d) for d in devices], "returned": len(devices)}
 
+    def _latest_vital_payload(svc: MonitoringService) -> dict[str, Any]:
+        """Single source of truth for the latest-vital response (shared by the
+        canonical route and the legacy ``/latest`` alias)."""
+        v = svc.repos.vitals.latest()
+        if v is None:
+            return {"vital": None, "simulated": svc.simulation_mode}
+        return {"vital": vital_to_dict(v), "simulated": v.simulated}
+
     @app.get("/api/vitals/latest")
     async def latest_vital(request: Request) -> dict[str, Any]:
-        v = _svc(request).repos.vitals.latest()
-        if v is None:
-            return {"vital": None, "simulated": _svc(request).simulation_mode}
-        return {"vital": vital_to_dict(v), "simulated": v.simulated}
+        # Canonical latest-vital endpoint.
+        return _latest_vital_payload(_svc(request))
+
+    @app.get("/latest")
+    async def latest_vital_alias(request: Request) -> dict[str, Any]:
+        # Backward-compatible alias for the legacy iPhone vitals relay / prior
+        # VytalLink, which polled GET /latest. Identical response, schema, and
+        # no-vitals behavior as /api/vitals/latest (the canonical route).
+        return _latest_vital_payload(_svc(request))
 
     @app.get("/api/vitals")
     async def list_vitals(

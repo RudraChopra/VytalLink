@@ -109,11 +109,48 @@ def test_mps_probe_failure_falls_back_to_cpu(monkeypatch):
 
 
 def test_probe_functions_return_bool_on_failure(monkeypatch):
-    assert dev._probe_cuda(_fake_torch(cuda_avail=True, cuda_raises=True)) is False
-    assert dev._probe_cuda(_fake_torch(cuda_avail=False)) is False
-    assert dev._probe_cuda(_fake_torch(cuda_avail=True)) is True
-    assert dev._probe_mps(_fake_torch(cuda_avail=False, mps_avail=True, mps_raises=True)) is False
-    assert dev._probe_mps(_fake_torch(cuda_avail=False, mps_avail=True)) is True
+    # Each probe is memoized per process (the accelerator tensor op runs once);
+    # reset between distinct scenarios so each is evaluated freshly.
+    dev.reset_device_cache(); assert dev._probe_cuda(_fake_torch(cuda_avail=True, cuda_raises=True)) is False
+    dev.reset_device_cache(); assert dev._probe_cuda(_fake_torch(cuda_avail=False)) is False
+    dev.reset_device_cache(); assert dev._probe_cuda(_fake_torch(cuda_avail=True)) is True
+    dev.reset_device_cache(); assert dev._probe_mps(_fake_torch(cuda_avail=False, mps_avail=True, mps_raises=True)) is False
+    dev.reset_device_cache(); assert dev._probe_mps(_fake_torch(cuda_avail=False, mps_avail=True)) is True
+
+
+def test_probe_is_memoized_runs_tensor_op_once(monkeypatch):
+    # The MPS/CUDA tensor op must execute at most once per process — this is what
+    # keeps health/device_report (other threads) from ever creating a probe
+    # tensor concurrently with inference (the Apple-MPS cross-thread abort).
+    calls = {"mps": 0}
+    real = _fake_torch(cuda_avail=False, mps_avail=True)
+    orig_tensor = real.tensor
+
+    def counting_tensor(data, device=None):
+        if device == "mps":
+            calls["mps"] += 1
+        return orig_tensor(data, device=device)
+
+    real.tensor = counting_tensor
+    _use(monkeypatch, real)
+    dev.reset_device_cache()
+    assert dev._probe_mps(real) is True
+    assert dev._probe_mps(real) is True
+    assert dev._probe_mps(real) is True
+    assert calls["mps"] == 1
+
+
+def test_device_report_runs_no_accelerator_probe(monkeypatch):
+    # device_report()/gpu_info() must NEVER probe (no accelerator tensor op) —
+    # they run on the event-loop thread and would race inference. Guard the
+    # probe so a regression is caught.
+    _use(monkeypatch, _fake_torch(cuda_avail=False, mps_avail=True))
+    dev.reset_device_cache()
+    monkeypatch.setattr(dev, "_run_mps_probe", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("device_report probed MPS")))
+    monkeypatch.setattr(dev, "_run_cuda_probe", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("device_report probed CUDA")))
+    rpt = dev.device_report()  # must not raise
+    assert rpt["mps_available"] is True
+    assert rpt["selected_device"] == MPS_DEVICE  # probe-free static guess
 
 
 # --- explicit preference --------------------------------------------------

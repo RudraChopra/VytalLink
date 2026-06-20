@@ -83,7 +83,12 @@ class MonitoringService:
 
         self.db = db or Database(settings.database_path, clock=self.system_clock)
         self.repos = Repositories(self.db)
-        self.dispatcher = build_dispatcher(settings, self.repos, clock=self.system_clock)
+        # Synthetic fall testing (validation-only) forces alerts to dry-run so a
+        # forced fall can never page a real caregiver, and tags persisted events.
+        self.synthetic_mode = settings.synthetic_detection_active
+        self.dispatcher = build_dispatcher(
+            settings, self.repos, clock=self.system_clock, dry_run=self.synthetic_mode
+        )
         self.state_machine = FallEventStateMachine(
             confirm_seconds=settings.fall_confirm_seconds,
             clear_seconds=settings.fall_clear_seconds,
@@ -98,6 +103,7 @@ class MonitoringService:
             self.dispatcher,
             clock=self.event_clock,
             simulated=self.simulation_mode,
+            synthetic=self.synthetic_mode,
         )
         self.camera = build_camera(settings, clock=self.system_clock)
         self.detector = build_detector(settings, clock=self.system_clock)
@@ -149,6 +155,14 @@ class MonitoringService:
         self.settings.ensure_runtime_dirs()
         self.db.initialize()
 
+        if self.synthetic_mode:
+            log.warning(
+                "================ SYNTHETIC FALL TESTING ACTIVE ================ "
+                "Non-fall postures are being treated as falls for validation; "
+                "external alerts are DRY-RUN (no caregiver delivery) and every "
+                "event is tagged event_type='fall_synthetic'. NOT FOR PRODUCTION."
+            )
+
         if self.multi_camera_mode:
             # Multi-camera: one shared model + one inference lane (owned by the
             # monitor), N isolated RTSP workers. Each worker's observations are
@@ -165,7 +179,7 @@ class MonitoringService:
                 # loop; the bridge isolates any persist/alert failure per camera.
                 em = EventManager(
                     self.repos, sm, self.dispatcher,
-                    clock=self.system_clock, simulated=False,
+                    clock=self.system_clock, simulated=False, synthetic=self.synthetic_mode,
                 )
                 self._camera_event_managers[camera_id] = em
                 return make_event_bridge(em, loop, camera_id=camera_id)
@@ -704,9 +718,62 @@ class MonitoringService:
             # Whether a token is required to view the feed (NOT the token itself).
             "video_protected": self.video_token_required(),
         }
+        payload["model"] = self._model_block(det_health)
+        payload["startup"] = self._startup_block()
+        payload["synthetic_detection_mode"] = self.synthetic_mode
         if vision is not None:
             payload["vision"] = vision   # mode=rtsp_multi + per-camera (credential-free)
         return payload
+
+    def _model_load_count(self) -> int:
+        if self._multi_monitor is not None:
+            return getattr(self._multi_monitor, "model_load_count", 1)
+        return 1 if self._detector_health().get("loaded") else 0
+
+    def _model_block(self, det: dict[str, Any]) -> dict[str, Any]:
+        """Explicit model-lifecycle view for /health (credential-free).
+
+        states: ready | degraded | failed | loading. The model is never 'ready'
+        until it is loaded; a load error surfaces as 'failed' and (in live mode)
+        degrades overall health so consumers never treat it as usable."""
+        loaded = bool(det.get("loaded"))
+        status = det.get("status")
+        last_error = det.get("last_error")
+        if loaded and status == HealthStatus.OK.value:
+            state = "ready"
+        elif loaded and status == HealthStatus.DEGRADED.value:
+            state = "degraded"
+        elif last_error and not loaded:
+            state = "failed"
+        elif not loaded:
+            state = "loading"
+        else:
+            state = status
+        return {
+            "state": state,
+            "device": det.get("device"),
+            "load_count": self._model_load_count(),
+            "warmup_complete": det.get("warmup_ms") is not None,
+            "last_error": last_error,
+        }
+
+    def _startup_block(self) -> dict[str, Any]:
+        """Safe startup/retry status. attempt/max are set by the start wrapper
+        (start.sh) via env; absent -> a direct run, attempt 1."""
+        import os
+
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, "") or default)
+            except ValueError:
+                return default
+
+        return {
+            "attempt": _int("STARTUP_ATTEMPT", 1),
+            "max_attempts": _int("STARTUP_MAX_ATTEMPTS", 1),
+            "completed": bool(self._running),
+            "uptime_seconds": self.uptime_seconds(),
+        }
 
     def controls_enabled(self) -> bool:
         """Dev simulation controls are enabled only in development + simulation."""

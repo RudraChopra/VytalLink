@@ -20,7 +20,7 @@ flags are surfaced.
 
 from __future__ import annotations
 
-import functools
+import threading
 from typing import Any
 
 from vytallink.common.logging_setup import get_logger
@@ -30,6 +30,26 @@ log = get_logger("common.device")
 CUDA_DEVICE = "cuda:0"
 MPS_DEVICE = "mps"
 CPU_DEVICE = "cpu"
+
+# --- one-time accelerator probing (Apple-silicon MPS thread-safety) ----------
+# Probing an accelerator means creating a real tensor on it and synchronizing —
+# i.e. running Metal/CUDA command-buffer work. On Apple MPS, doing that on a
+# thread OTHER than the one running model inference aborts the process with a
+# Metal "addScheduledHandler after commit" assertion (it is a C++ assert -> not
+# catchable in Python). The detector resolves its device on the dedicated
+# inference thread during startup; the only other caller was `device_report()`
+# (reached from /health on the event-loop thread), which created a SECOND MPS
+# tensor and raced steady-state inference.
+#
+# Fix: the actual probe runs at most ONCE per process (memoized under a lock),
+# so it lands on the inference thread that resolves first; and `device_report()`
+# never probes — it uses only static availability checks plus the device the
+# detector publishes here. Together these guarantee no accelerator command
+# buffer is ever created off the inference thread.
+_probe_lock = threading.Lock()
+_cuda_usable: bool | None = None
+_mps_usable: bool | None = None
+_resolved_device: str | None = None  # published by select_device() after it resolves
 
 
 def _load_torch() -> Any | None:
@@ -43,8 +63,7 @@ def _load_torch() -> Any | None:
         return None
 
 
-def _probe_cuda(torch: Any) -> bool:
-    """True only if CUDA is available AND a real CUDA tensor op succeeds."""
+def _run_cuda_probe(torch: Any) -> bool:
     try:
         if not torch.cuda.is_available():
             return False
@@ -57,8 +76,7 @@ def _probe_cuda(torch: Any) -> bool:
         return False
 
 
-def _probe_mps(torch: Any) -> bool:
-    """True only if MPS is available AND a real MPS tensor op succeeds."""
+def _run_mps_probe(torch: Any) -> bool:
     try:
         backend = getattr(getattr(torch, "backends", None), "mps", None)
         if backend is None or not backend.is_available():
@@ -70,6 +88,32 @@ def _probe_mps(torch: Any) -> bool:
     except Exception as exc:
         log.warning("MPS probe failed (%s); not selecting MPS", type(exc).__name__)
         return False
+
+
+def _probe_cuda(torch: Any) -> bool:
+    """True only if CUDA is available AND a real CUDA tensor op succeeds.
+
+    Memoized: the tensor op runs at most once per process, so it executes on the
+    first caller's thread (the inference thread during startup) and never again.
+    """
+    global _cuda_usable
+    with _probe_lock:
+        if _cuda_usable is None:
+            _cuda_usable = _run_cuda_probe(torch)
+        return _cuda_usable
+
+
+def _probe_mps(torch: Any) -> bool:
+    """True only if MPS is available AND a real MPS tensor op succeeds.
+
+    Memoized (see :func:`_probe_cuda`) so the MPS command-buffer op runs exactly
+    once, on the inference thread — never concurrently from another thread.
+    """
+    global _mps_usable
+    with _probe_lock:
+        if _mps_usable is None:
+            _mps_usable = _run_mps_probe(torch)
+        return _mps_usable
 
 
 def synchronize_mps(torch: Any) -> None:
@@ -115,40 +159,70 @@ def device_label(device: str | None) -> str:
     return device
 
 
+def _publish_resolved_device(dev: str) -> str:
+    """Record the device the inference path resolved, so probe-free callers
+    (``device_report`` / health) report the authoritative value."""
+    global _resolved_device
+    _resolved_device = dev
+    return dev
+
+
+def resolved_device() -> str | None:
+    """The device the inference path last resolved, or ``None`` before startup."""
+    return _resolved_device
+
+
 def select_device(preference: str | None = None) -> str:
     """Return the inference device string, probing in order CUDA → MPS → CPU.
 
     A non-empty ``preference`` is honored when its probe succeeds; ``"cpu"`` is
     always honored. A preference that fails its probe falls through to
-    auto-selection rather than crashing. Never raises.
+    auto-selection rather than crashing. Never raises. The chosen device is
+    published for probe-free callers (see :func:`device_report`).
+
+    The probe (a real accelerator tensor op) runs at most once per process, so
+    calling this from the dedicated inference thread at startup is what fixes the
+    Apple-MPS cross-thread abort — no other thread ever creates a probe tensor.
     """
     torch = _load_torch()
     if torch is None:
-        return CPU_DEVICE
+        return _publish_resolved_device(CPU_DEVICE)
 
     if preference:
         pref = preference.strip().lower()
         if pref == CPU_DEVICE:
-            return CPU_DEVICE
+            return _publish_resolved_device(CPU_DEVICE)
         if pref.startswith("cuda") and _probe_cuda(torch):
-            return preference
+            return _publish_resolved_device(preference)
         if pref == MPS_DEVICE and _probe_mps(torch):
-            return MPS_DEVICE
+            return _publish_resolved_device(MPS_DEVICE)
         log.warning("Requested inference device %r is not usable; auto-selecting", preference)
 
     if _probe_cuda(torch):
-        return CUDA_DEVICE
+        return _publish_resolved_device(CUDA_DEVICE)
     if _probe_mps(torch):
+        return _publish_resolved_device(MPS_DEVICE)
+    return _publish_resolved_device(CPU_DEVICE)
+
+
+def _static_device_guess(cuda_available: bool, mps_available: bool) -> str:
+    """Probe-free best guess at the inference device from availability flags
+    alone (no tensor op). Only used before the inference path has resolved."""
+    if cuda_available:
+        return CUDA_DEVICE
+    if mps_available:
         return MPS_DEVICE
     return CPU_DEVICE
 
 
-@functools.lru_cache(maxsize=1)
 def device_report() -> dict[str, Any]:
-    """Safe, cached device snapshot for diagnostics / health.
+    """Safe device snapshot for diagnostics / health.
 
-    Contains only device strings, version strings, and boolean flags — no
-    filesystem paths, hostnames, or other host-private information.
+    Uses ONLY static availability checks (``is_available``/``is_built`` create no
+    command buffer) plus the device the inference path published — it never runs
+    an accelerator probe, so it is safe to call from the event-loop / any thread
+    concurrently with inference. Contains only device strings, version strings,
+    and boolean flags — no filesystem paths or host-private information.
     """
     info: dict[str, Any] = {
         "selected_device": CPU_DEVICE,
@@ -173,10 +247,18 @@ def device_report() -> dict[str, Any]:
             info["mps_available"] = bool(backend.is_available())
     except Exception:  # pragma: no cover - defensive
         pass
-    info["selected_device"] = select_device()
+    # Authoritative once the inference path has resolved; a probe-free guess
+    # before that. NEVER calls select_device() (which would probe on this thread).
+    info["selected_device"] = _resolved_device or _static_device_guess(
+        info["cuda_available"], info["mps_available"]
+    )
     return info
 
 
 def reset_device_cache() -> None:
-    """Clear the cached :func:`device_report` (used in tests)."""
-    device_report.cache_clear()
+    """Reset memoized probe results + the published device (used in tests)."""
+    global _cuda_usable, _mps_usable, _resolved_device
+    with _probe_lock:
+        _cuda_usable = None
+        _mps_usable = None
+        _resolved_device = None

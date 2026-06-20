@@ -75,6 +75,38 @@ def test_overall_health_degrades_when_detector_degraded(client):
     assert client.get("/health").json()["overall"] == "degraded"
 
 
+def test_latest_alias_matches_canonical(client):
+    # /latest is a backward-compatible alias for the legacy iPhone relay; it must
+    # return the exact same payload + schema as /api/vitals/latest.
+    a = client.get("/api/vitals/latest")
+    b = client.get("/latest")
+    assert a.status_code == 200 and b.status_code == 200
+    assert a.json() == b.json()
+    assert set(b.json().keys()) == {"vital", "simulated"}
+    assert "password" not in b.text.lower() and "rtsp://" not in b.text
+
+
+def test_health_model_startup_and_synthetic_blocks(client):
+    h = client.get("/health").json()
+    assert set(h["model"]) >= {"state", "device", "load_count", "warmup_complete", "last_error"}
+    assert h["model"]["state"] in ("ready", "degraded", "failed", "loading")
+    assert h["model"]["load_count"] >= 0
+    assert h["startup"]["max_attempts"] >= 1 and "completed" in h["startup"]
+    assert h["synthetic_detection_mode"] is False  # off by default
+
+
+def test_health_model_failed_surfaces_and_degrades(client):
+    # A model that failed to load must report state=failed and (live mode) degrade
+    # overall health so consumers never treat it as usable.
+    svc = client._service
+    svc.simulation_mode = False
+    svc.detector.health = lambda: {"status": "down", "name": "yolo", "loaded": False,
+                                   "last_error": "boom"}
+    h = client.get("/health").json()
+    assert h["model"]["state"] == "failed"
+    assert h["overall"] in ("down", "degraded")
+
+
 def test_healthy_simulation_reports_overall_ok(client):
     """Regression: a freshly started simulation (no live video, no real camera
     frames) is fully healthy. The simulated camera must not drag overall health
