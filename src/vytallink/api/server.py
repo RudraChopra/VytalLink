@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -21,6 +21,7 @@ from vytallink import APP_NAME, __version__
 from vytallink.api.schemas import (
     LabelRequest,
     ResolveRequest,
+    VitalsIngest,
     device_to_dict,
     event_to_dict,
     vital_to_dict,
@@ -169,11 +170,18 @@ def _register_routes(app: FastAPI) -> None:
 
     def _latest_vital_payload(svc: MonitoringService) -> dict[str, Any]:
         """Single source of truth for the latest-vital response (shared by the
-        canonical route and the legacy ``/latest`` alias)."""
+        canonical route and the legacy ``/latest`` alias). Legacy top-level
+        fields (``vital``, ``simulated``) are preserved; structured
+        ``vision``/``freshness``/``alert`` sections are added for new clients."""
         v = svc.repos.vitals.latest()
-        if v is None:
-            return {"vital": None, "simulated": svc.simulation_mode}
-        return {"vital": vital_to_dict(v), "simulated": v.simulated}
+        ps = svc.patient_state()
+        return {
+            "vital": vital_to_dict(v) if v is not None else None,
+            "simulated": (v.simulated if v is not None else svc.simulation_mode),
+            "vision": ps["vision"],
+            "freshness": ps["freshness"],
+            "alert": ps["alert"],
+        }
 
     @app.get("/api/vitals/latest")
     async def latest_vital(request: Request) -> dict[str, Any]:
@@ -204,6 +212,32 @@ def _register_routes(app: FastAPI) -> None:
             "total": repos.vitals.count(),
             "simulated": _svc(request).simulation_mode,
         }
+
+    @app.post("/api/vitals")
+    async def ingest_vitals(request: Request, body: VitalsIngest) -> dict[str, Any]:
+        # iPhone vitals ingestion. NOTE: this path/payload is a VytalLink-defined
+        # contract (no prior iPhone schema existed) — verify against the device.
+        svc = _svc(request)
+        cl = request.headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > svc.settings.vitals_ingest_max_bytes:
+            raise HTTPException(status_code=413, detail="payload too large")
+        # ValueError (bad/future/old timestamp) -> 400 via the error handler; a
+        # malformed/invalid body is rejected by pydantic with 422. Neither leaks
+        # internals, and the service never logs values or the full payload.
+        row, idempotent = svc.ingest_vitals(body)
+        return {
+            "accepted": True,
+            "idempotent": idempotent,
+            "device_id": row.device_id,
+            "source_timestamp": row.timestamp,
+            "received_at": (row.metadata or {}).get("received_at"),
+        }
+
+    @app.get("/api/patient")
+    async def patient_state(request: Request) -> dict[str, Any]:
+        # Full normalized patient state (vitals + per-camera vision + freshness +
+        # informational alert score). The alert score is NOT a medical diagnosis.
+        return _svc(request).patient_state()
 
     # -- live camera feed (opt-in, development only; never saves footage) ---
     @app.get("/api/camera/snapshot.jpg")

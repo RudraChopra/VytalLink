@@ -24,7 +24,7 @@ import asyncio
 import hmac
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from vytallink import __phase__, __version__
@@ -41,6 +41,9 @@ from vytallink.monitoring import system_info
 from vytallink.vision import build_camera, build_detector, detections_to_evidence
 from vytallink.vision.detector_simulated import Scenario, SimulatedFallDetector
 from vytallink.vision.multi_camera import build_multi_camera_monitor, make_event_bridge
+from vytallink.monitoring.alert_score import ScoreThresholds
+from vytallink.monitoring.freshness import FreshnessThresholds
+from vytallink.monitoring.patient_state import build_patient_state
 from vytallink.vision.evidence import FallEvidenceSmoother
 from vytallink.wearable import build_wearable
 
@@ -351,6 +354,135 @@ class MonitoringService:
         )
         self._last_vital = row
         self._update_device(reading.device_id, HealthStatus.OK, seen=True)
+
+    # -- iPhone vitals ingestion + normalized patient state ----------------
+    def ingest_vitals(self, payload: Any) -> tuple[VitalRow, bool]:
+        """Validate timing + store one iPhone vitals sample (a validated
+        VitalsIngest). Returns (row, idempotent). Raises ValueError on an
+        unparseable / future / too-old timestamp. Never logs values/full payload.
+
+        NOTE: there was no prior iPhone contract in this repo — POST /api/vitals
+        and this payload shape are defined here and unverified against a device.
+        """
+        now = self.system_clock.now()
+        source_ts = self._parse_source_timestamp(getattr(payload, "timestamp", None), now)
+        device_id = (getattr(payload, "device_id", None) or "iphone-1")[:64]
+        sample_id = getattr(payload, "sample_id", None)
+        rr = getattr(payload, "respiratory_rate", None)
+        posture = getattr(payload, "posture", None)
+        # Idempotency: a retried sample (same device + sample_id) is not re-stored.
+        if sample_id:
+            for existing in self.repos.vitals.list(limit=25, device_id=device_id):
+                if (existing.metadata or {}).get("sample_id") == sample_id:
+                    return existing, True
+        metadata = {
+            "source": "iphone",
+            "received_at": isoformat(now),
+            "respiratory_rate": rr,
+            "posture": posture,
+            "phone_alert_score": getattr(payload, "phone_alert_score", None),
+            "activity": getattr(payload, "motion", None),
+            "sample_id": sample_id,
+        }
+        row = self.repos.vitals.insert(
+            VitalRow(
+                timestamp=isoformat(source_ts), device_id=device_id,
+                heart_rate=getattr(payload, "heart_rate", None),
+                motion=getattr(payload, "motion", None),
+                connection_quality=None, battery=getattr(payload, "battery", None),
+                simulated=False, metadata=metadata,
+            )
+        )
+        self._last_vital = row
+        signals = "+".join(
+            k for k, val in (("hr", row.heart_rate), ("rr", rr), ("motion", row.motion), ("posture", posture))
+            if val is not None
+        )
+        log.info(
+            "Ingested iPhone vitals device=%s signals=[%s] age=%.1fs",  # safe: no values
+            device_id, signals, max(0.0, (now - source_ts).total_seconds()),
+        )
+        return row, False
+
+    def _parse_source_timestamp(self, ts_str: str | None, now: datetime) -> datetime:
+        if not ts_str:
+            return now
+        try:
+            parsed = datetime.fromisoformat(str(ts_str).strip().replace("Z", "+00:00"))
+        except Exception:
+            raise ValueError("timestamp is not valid ISO-8601")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = (parsed - now).total_seconds()
+        if delta > self.settings.vitals_max_future_skew_seconds:
+            raise ValueError("timestamp is in the future")
+        if -delta > self.settings.vitals_reject_older_than_seconds:
+            raise ValueError("timestamp is too old")
+        return parsed
+
+    @staticmethod
+    def _parse_iso(s: str | None) -> datetime | None:
+        if not s:
+            return None
+        try:
+            d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    def _active_incident_id(self) -> str | None:
+        """Most recent unresolved incident (confirmed/recovering), or None."""
+        try:
+            row = self.db.query_one(
+                "SELECT event_uid FROM events WHERE state IN ('confirmed_fall','recovering') "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return row["event_uid"] if row else None
+
+    def _camera_summaries(self) -> list[dict[str, Any]]:
+        """Per-camera primitives for patient-state aggregation (mode-agnostic)."""
+        out: list[dict[str, Any]] = []
+        if self.multi_camera_mode and self._multi_monitor is not None:
+            for cid, c in self._multi_monitor.health().get("cameras", {}).items():
+                age_ms = c.get("last_frame_age_ms")
+                out.append({
+                    "id": cid, "connected": bool(c.get("connected")),
+                    "fall_state": c.get("fall_state", "normal"),
+                    "frame_age_seconds": (age_ms / 1000.0) if age_ms is not None else None,
+                    "person_count": c.get("person_count"), "fall_confidence": None,
+                })
+        else:
+            ch = self.camera.health()
+            age = ch.get("last_frame_age_seconds")
+            if self.simulation_mode and age is None:
+                age = 0.0  # simulation synthesizes frames continuously -> fresh
+            out.append({
+                "id": self.settings.camera_device_id,
+                "connected": bool(ch.get("opened", self.simulation_mode)),
+                "fall_state": self.state_machine.state.value,
+                "frame_age_seconds": age, "person_count": None,
+                "fall_confidence": self._last_evidence_score or None,
+            })
+        return out
+
+    def patient_state(self) -> dict[str, Any]:
+        """Normalized patient state: latest vitals + per-camera fall state +
+        freshness + informational alert score (raw vs computed distinguishable)."""
+        now = self.system_clock.now()
+        v = self.repos.vitals.latest()
+        source_ts = received_at = None
+        if v is not None:
+            source_ts = self._parse_iso(v.timestamp)
+            md = v.metadata or {}
+            received_at = self._parse_iso(md.get("received_at") or v.created_at)
+        return build_patient_state(
+            now=now, vital=v, received_at=received_at, source_timestamp=source_ts,
+            cameras=self._camera_summaries(), active_incident_id=self._active_incident_id(),
+            fresh_thr=FreshnessThresholds.from_settings(self.settings),
+            score_thr=ScoreThresholds.from_settings(self.settings),
+        )
 
     async def _monitor_loop(self) -> None:
         if self.simulation_mode:

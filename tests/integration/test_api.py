@@ -81,8 +81,9 @@ def test_latest_alias_matches_canonical(client):
     a = client.get("/api/vitals/latest")
     b = client.get("/latest")
     assert a.status_code == 200 and b.status_code == 200
-    assert a.json() == b.json()
-    assert set(b.json().keys()) == {"vital", "simulated"}
+    assert a.json() == b.json()                              # the two routes are equivalent
+    assert {"vital", "simulated"} <= set(b.json().keys())    # legacy fields preserved
+    assert {"vision", "freshness", "alert"} <= set(b.json().keys())  # new sections added
     assert "password" not in b.text.lower() and "rtsp://" not in b.text
 
 

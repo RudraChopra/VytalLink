@@ -2,12 +2,80 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vytallink.database.models import AlertRow, DeviceRow, EventRow, VitalRow
 from vytallink.events.states import HumanLabel
+
+
+def _finite_in_range(v: float | None, lo: float, hi: float, name: str) -> float | None:
+    if v is None:
+        return None
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError(f"{name} must be a finite number")
+    if not (lo <= v <= hi):
+        raise ValueError(f"{name} out of plausible range [{lo}, {hi}]")
+    return v
+
+
+class VitalsIngest(BaseModel):
+    """iPhone vitals ingestion payload for POST /api/vitals.
+
+    IMPORTANT: no prior iPhone contract existed in this repo — this schema is
+    defined by VytalLink and must be verified against the real device. All fields
+    are optional but at least one vital signal is required. Common field-name
+    variants are accepted. Ranges are plausibility guards, NOT medical limits.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    heart_rate: float | None = Field(default=None, validation_alias=AliasChoices("heart_rate", "hr", "bpm"))
+    respiratory_rate: float | None = Field(
+        default=None, validation_alias=AliasChoices("respiratory_rate", "rr", "breathing_rate", "resp_rate")
+    )
+    motion: float | None = Field(default=None, validation_alias=AliasChoices("motion", "activity", "activity_level"))
+    posture: str | None = Field(default=None, max_length=32)
+    battery: float | None = None
+    phone_alert_score: float | None = Field(
+        default=None, validation_alias=AliasChoices("phone_alert_score", "alert_score")
+    )
+    device_id: str | None = Field(default=None, max_length=64)
+    timestamp: str | None = Field(default=None, validation_alias=AliasChoices("timestamp", "time", "ts"))
+    sample_id: str | None = Field(default=None, max_length=128, validation_alias=AliasChoices("sample_id", "id"))
+
+    @field_validator("heart_rate")
+    @classmethod
+    def _hr(cls, v):  # noqa: ANN001
+        return _finite_in_range(v, 20.0, 300.0, "heart_rate")
+
+    @field_validator("respiratory_rate")
+    @classmethod
+    def _rr(cls, v):  # noqa: ANN001
+        return _finite_in_range(v, 3.0, 60.0, "respiratory_rate")
+
+    @field_validator("motion")
+    @classmethod
+    def _motion(cls, v):  # noqa: ANN001
+        return _finite_in_range(v, 0.0, 1.0, "motion")
+
+    @field_validator("battery", "phone_alert_score")
+    @classmethod
+    def _unit(cls, v):  # noqa: ANN001
+        return _finite_in_range(v, 0.0, 1.0, "value")
+
+    @field_validator("posture")
+    @classmethod
+    def _posture(cls, v):  # noqa: ANN001
+        return v.strip().lower()[:32] if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _at_least_one_signal(self) -> "VitalsIngest":
+        if self.heart_rate is None and self.respiratory_rate is None and self.motion is None and self.posture is None:
+            raise ValueError("at least one of heart_rate, respiratory_rate, motion, posture is required")
+        return self
 
 
 class LabelRequest(BaseModel):
@@ -67,6 +135,9 @@ def alert_to_dict(a: AlertRow) -> dict[str, Any]:
 
 
 def vital_to_dict(v: VitalRow) -> dict[str, Any]:
+    md = v.metadata or {}
+    # Legacy top-level fields are preserved unchanged; new fields (from the iPhone
+    # payload, stored in metadata) are added without breaking existing clients.
     return {
         "timestamp": v.timestamp,
         "device_id": v.device_id,
@@ -75,6 +146,10 @@ def vital_to_dict(v: VitalRow) -> dict[str, Any]:
         "connection_quality": v.connection_quality,
         "battery": v.battery,
         "simulated": v.simulated,
+        "respiratory_rate": md.get("respiratory_rate"),
+        "posture": md.get("posture"),
+        "phone_alert_score": md.get("phone_alert_score"),
+        "source": md.get("source"),
     }
 
 

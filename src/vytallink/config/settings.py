@@ -203,6 +203,24 @@ class Settings(BaseSettings):
     )
     disk_warning_percent: float = Field(default=90.0, validation_alias="DISK_WARNING_PERCENT")
 
+    # ---- Patient state / vitals freshness & scoring -----------------------
+    # Freshness classification ages (seconds). Operator-tunable; NOT medical.
+    vitals_fresh_seconds: float = Field(default=15.0, validation_alias="VITALS_FRESH_SECONDS")
+    vitals_aging_seconds: float = Field(default=45.0, validation_alias="VITALS_AGING_SECONDS")
+    vitals_stale_seconds: float = Field(default=90.0, validation_alias="VITALS_STALE_SECONDS")
+    camera_frame_fresh_seconds: float = Field(default=5.0, validation_alias="CAMERA_FRAME_FRESH_SECONDS")
+    camera_frame_stale_seconds: float = Field(default=15.0, validation_alias="CAMERA_FRAME_STALE_SECONDS")
+    # iPhone ingestion guards.
+    vitals_ingest_max_bytes: int = Field(default=8192, validation_alias="VITALS_INGEST_MAX_BYTES")
+    vitals_max_future_skew_seconds: float = Field(default=60.0, validation_alias="VITALS_MAX_FUTURE_SKEW_SECONDS")
+    vitals_reject_older_than_seconds: float = Field(default=3600.0, validation_alias="VITALS_REJECT_OLDER_THAN_SECONDS")
+    # Abnormal-vital thresholds for the informational alert score (NOT a medical
+    # diagnosis; tune for the deployment). A value outside [low, high] is flagged.
+    vitals_hr_low: float = Field(default=40.0, validation_alias="VITALS_HR_LOW")
+    vitals_hr_high: float = Field(default=120.0, validation_alias="VITALS_HR_HIGH")
+    vitals_rr_low: float = Field(default=8.0, validation_alias="VITALS_RR_LOW")
+    vitals_rr_high: float = Field(default=30.0, validation_alias="VITALS_RR_HIGH")
+
     # ---- Live detection pacing (live modes only) --------------------------
     # The live detection loop runs on the FRESHEST frame, paced to at most this
     # many inferences/second (it no longer adds a fixed monitor_loop_interval
