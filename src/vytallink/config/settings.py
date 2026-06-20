@@ -221,6 +221,18 @@ class Settings(BaseSettings):
     vitals_rr_low: float = Field(default=8.0, validation_alias="VITALS_RR_LOW")
     vitals_rr_high: float = Field(default=30.0, validation_alias="VITALS_RR_HIGH")
 
+    # ---- Stale-incident reconciliation ------------------------------------
+    # An unresolved incident older than this with no current camera support is
+    # auto-resolved so it cannot pin the alert baseline forever. A genuinely
+    # ongoing fall (source camera still active) is never closed; a configured but
+    # offline camera leaves the incident OPEN (ambiguous) and degrades health.
+    incident_stale_seconds: float = Field(default=300.0, validation_alias="INCIDENT_STALE_SECONDS")
+    incident_reconcile_on_startup: bool = Field(default=True, validation_alias="INCIDENT_RECONCILE_ON_STARTUP")
+    incident_auto_resolve_enabled: bool = Field(default=True, validation_alias="INCIDENT_AUTO_RESOLVE_ENABLED")
+    incident_reconcile_interval_seconds: float = Field(
+        default=60.0, validation_alias="INCIDENT_RECONCILE_INTERVAL_SECONDS"
+    )
+
     # ---- Live detection pacing (live modes only) --------------------------
     # The live detection loop runs on the FRESHEST frame, paced to at most this
     # many inferences/second (it no longer adds a fixed monitor_loop_interval

@@ -178,6 +178,34 @@ To reconcile when a real payload is available:
 4. If fields are unmapped, add aliases to `api/schemas.VITALS_ALIASES` deliberately.
 5. Add the sanitized fixture under `tests/` and re-run the suite.
 
+## Stale-incident reconciliation
+
+An unresolved fall incident must not pin the patient alert baseline forever. A
+reconciler runs **once on startup** and on a **bounded runtime interval**
+(`INCIDENT_RECONCILE_INTERVAL_SECONDS`, default 60s), resolving stale incidents
+via the supported resolve path (no new alert; the incident snapshot is untouched;
+history is preserved — never deleted).
+
+Policy (per incident, by `event.source_device`):
+
+| condition | action |
+|-----------|--------|
+| age ≤ `INCIDENT_STALE_SECONDS` (300) | **keep** (recent; guards brief frame delays) |
+| source camera not in current config (orphaned) | **resolve** `stale_incident_timeout` |
+| source camera fresh + currently in an active fall | **keep** (genuinely ongoing) |
+| source camera fresh + currently normal | **resolve** `camera_recovered` |
+| source camera configured but offline/stale | **keep, mark degraded** (ambiguous) |
+
+Resolution requires **positive** evidence (orphaned, or a fresh source camera
+showing normal) — a configured camera that is merely offline is *absence of
+evidence*, so the incident stays open and `/health` goes degraded. Crucially, a
+sustained `confirmed_fall` does not advance `updated_at`, so the decision uses the
+camera's **current live state**, never age alone — an ongoing fall is never
+closed. `/health.persistence.reconciliation` surfaces enabled/counts/failures/
+open-ambiguous (no incident details). Config: `INCIDENT_STALE_SECONDS`,
+`INCIDENT_RECONCILE_ON_STARTUP`, `INCIDENT_AUTO_RESOLVE_ENABLED`,
+`INCIDENT_RECONCILE_INTERVAL_SECONDS`.
+
 ## Privacy
 
 Only normalized vitals are stored; full request bodies are never persisted or
