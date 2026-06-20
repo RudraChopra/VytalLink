@@ -13,10 +13,13 @@ from __future__ import annotations
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from pydantic import Field, field_validator, model_validator
+if TYPE_CHECKING:
+    from vytallink.config.cameras import CameraConfig
+
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from vytallink.common.errors import ConfigError
@@ -63,6 +66,11 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    # Whether configured_cameras() may read CAMERA_{N}_* from the on-disk .env.
+    # load_settings() (tests / sim harness) sets this False for isolation, so a
+    # developer's local .env never silently flips tests into multi-camera mode.
+    _read_env_file_cameras: bool = PrivateAttr(default=True)
 
     # ---- Core service -----------------------------------------------------
     env: Environment = Field(default=Environment.DEVELOPMENT, validation_alias="VYTALLINK_ENV")
@@ -477,6 +485,29 @@ class Settings(BaseSettings):
             "dashboard_video_token": sanitize_secret(self.dashboard_video_token),
         }
 
+    def configured_cameras(self) -> list["CameraConfig"]:
+        """Enabled multi-camera configs from ``CAMERA_{N}_*`` (``.env`` + process
+        env; process env wins, mirroring pydantic precedence). Empty unless
+        multi-camera is explicitly enabled, so single-camera/simulation is
+        unaffected. ``CameraConfig`` is imported lazily to avoid a cycle."""
+        import os
+
+        from vytallink.config.cameras import cameras_from_env
+
+        merged: dict[str, str] = {}
+        env_file = self.model_config.get("env_file")
+        if self._read_env_file_cameras and env_file and Path(str(env_file)).exists():
+            from dotenv import dotenv_values  # provided by pydantic-settings
+
+            merged.update({k: v for k, v in dotenv_values(str(env_file)).items() if v is not None})
+        merged.update(os.environ)
+        return cameras_from_env(merged)
+
+    @property
+    def multi_camera_enabled(self) -> bool:
+        """True when at least one ``CAMERA_{N}_*`` camera is enabled."""
+        return bool(self.configured_cameras())
+
     def ensure_runtime_dirs(self) -> None:
         """Create the local runtime directories this configuration needs."""
         for d in (
@@ -502,7 +533,9 @@ def load_settings(**overrides: Any) -> Settings:
     (``_env_file=None``), so tests are isolated from a developer's local config.
     The application singleton :func:`get_settings` DOES read ``.env``.
     """
-    return Settings(_env_file=None, **overrides)
+    s = Settings(_env_file=None, **overrides)
+    s._read_env_file_cameras = False  # keep multi-camera config out of tests
+    return s
 
 
 def reset_settings_cache() -> None:

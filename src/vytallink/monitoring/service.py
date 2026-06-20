@@ -40,6 +40,7 @@ from vytallink.events import EventManager, FallEventStateMachine, FallState
 from vytallink.monitoring import system_info
 from vytallink.vision import build_camera, build_detector, detections_to_evidence
 from vytallink.vision.detector_simulated import Scenario, SimulatedFallDetector
+from vytallink.vision.multi_camera import build_multi_camera_monitor, make_event_bridge
 from vytallink.vision.evidence import FallEvidenceSmoother
 from vytallink.wearable import build_wearable
 
@@ -56,7 +57,19 @@ class MonitoringService:
     ) -> None:
         self.settings = settings
         self.system_clock = SystemClock()
-        self.simulation_mode = settings.vision_mode == VisionMode.SIMULATION
+        # Multi-camera mode is active when any CAMERA_{N}_* camera is enabled. It
+        # overrides simulation: real RTSP cameras run through MultiCameraMonitor.
+        self._camera_configs = settings.configured_cameras()
+        self.multi_camera_mode = bool(self._camera_configs)
+        self.simulation_mode = (
+            settings.vision_mode == VisionMode.SIMULATION and not self.multi_camera_mode
+        )
+        self._multi_monitor = None  # built in start() when multi_camera_mode
+        # One EventManager per camera (built in start(), on the loop). Each wraps
+        # that camera's own state machine (source_device=camera_id) and SHARES the
+        # one repos + dispatcher, so multi-camera events persist + alert through
+        # the exact same path as the single-camera mode — no parallel system.
+        self._camera_event_managers: dict[str, EventManager] = {}
 
         # In simulation, the event timeline is driven by a ManualClock so falls
         # can be confirmed instantly & deterministically. In live mode, the
@@ -135,6 +148,47 @@ class MonitoringService:
             return
         self.settings.ensure_runtime_dirs()
         self.db.initialize()
+
+        if self.multi_camera_mode:
+            # Multi-camera: one shared model + one inference lane (owned by the
+            # monitor), N isolated RTSP workers. Each worker's observations are
+            # bridged to a per-camera EventManager so confirmed falls persist to
+            # the DB and dispatch alerts through the SAME path single-camera uses.
+            loop = asyncio.get_running_loop()
+            self._camera_event_managers = {}
+
+            def _observe_factory(camera_id: str, sm: FallEventStateMachine):
+                # Reuse the existing EventManager: same repos (one locked
+                # connection) and same dispatcher, with this camera's own state
+                # machine (source_device=camera_id, so every persisted event and
+                # AlertEvent is tagged with the camera). observe() runs on the
+                # loop; the bridge isolates any persist/alert failure per camera.
+                em = EventManager(
+                    self.repos, sm, self.dispatcher,
+                    clock=self.system_clock, simulated=False,
+                )
+                self._camera_event_managers[camera_id] = em
+                return make_event_bridge(em, loop, camera_id=camera_id)
+
+            # Built here so the running loop is captured for the bridge; started
+            # off the loop so the model load (seconds) never blocks startup.
+            self._multi_monitor = build_multi_camera_monitor(
+                self.settings, self._camera_configs, detector=self.detector,
+                clock=self.system_clock, observe_factory=_observe_factory,
+            )
+            await asyncio.to_thread(self._multi_monitor.start)
+            self._register_devices()
+            self._started_at = self.system_clock.now()
+            self._running = True
+            self._connect_wearable_safe()
+            await self._sample_wearable_once()
+            self._tasks = [asyncio.create_task(self._wearable_loop(), name="vytallink-wearable")]
+            log.info(
+                "MonitoringService started (mode=rtsp_multi, cameras=%d, env=%s)",
+                len(self._camera_configs), self.settings.env.value,
+            )
+            return
+
         # Pin model load + warmup to the dedicated inference thread so every later
         # inference runs on the SAME thread (MPS/Metal thread-affinity).
         self._infer_executor = ThreadPoolExecutor(
@@ -150,12 +204,7 @@ class MonitoringService:
         except CameraError as exc:
             log.warning("Camera did not open at startup: %s", exc)
 
-        try:
-            self.wearable.connect()
-            self._update_device(self.settings.wearable_device_id, HealthStatus.OK)
-        except Exception as exc:
-            log.warning("Wearable did not connect at startup: %s", exc)
-            self._update_device(self.settings.wearable_device_id, HealthStatus.DOWN, error=str(exc))
+        self._connect_wearable_safe()
 
         self._started_at = self.system_clock.now()
         self._running = True
@@ -171,6 +220,14 @@ class MonitoringService:
             self.settings.env.value,
         )
 
+    def _connect_wearable_safe(self) -> None:
+        try:
+            self.wearable.connect()
+            self._update_device(self.settings.wearable_device_id, HealthStatus.OK)
+        except Exception as exc:
+            log.warning("Wearable did not connect at startup: %s", exc)
+            self._update_device(self.settings.wearable_device_id, HealthStatus.DOWN, error=str(exc))
+
     async def stop(self) -> None:
         if not self._running:
             return
@@ -183,10 +240,16 @@ class MonitoringService:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown best-effort
                 pass
         self._tasks = []
-        try:
-            self.camera.close()
-        except Exception:  # pragma: no cover - defensive
-            pass
+        if self._multi_monitor is not None:
+            try:
+                await asyncio.to_thread(self._multi_monitor.stop)
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
+        else:
+            try:
+                self.camera.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
         self.wearable.disconnect()
         await self.dispatcher.aclose()
         self.db.close()
@@ -197,15 +260,27 @@ class MonitoringService:
 
     # -- device registration ----------------------------------------------
     def _register_devices(self) -> None:
-        self.repos.devices.upsert(
-            DeviceRow(
-                device_id=self.settings.camera_device_id,
-                device_type="camera",
-                display_name=self.camera.description,
-                connection_status=self.camera.status().value,
-                metadata={"mode": self.settings.vision_mode.value},
+        if self.multi_camera_mode:
+            for cfg in self._camera_configs:
+                self.repos.devices.upsert(
+                    DeviceRow(
+                        device_id=cfg.camera_id,
+                        device_type="camera",
+                        display_name=cfg.safe_label(),     # host:port, no creds
+                        connection_status=HealthStatus.UNKNOWN.value,
+                        metadata={"mode": "rtsp_multi"},
+                    )
+                )
+        else:
+            self.repos.devices.upsert(
+                DeviceRow(
+                    device_id=self.settings.camera_device_id,
+                    device_type="camera",
+                    display_name=self.camera.description,
+                    connection_status=self.camera.status().value,
+                    metadata={"mode": self.settings.vision_mode.value},
+                )
             )
-        )
         self.repos.devices.upsert(
             DeviceRow(
                 device_id=self.settings.wearable_device_id,
@@ -527,18 +602,44 @@ class MonitoringService:
             "providers": self.dispatcher.provider_names,
         }
 
+    def _aggregate_camera_health(self, vision: dict[str, Any]) -> dict[str, Any]:
+        """Summarize per-camera health into the legacy ``camera`` block + a
+        worst-of status used by the overall-health computation."""
+        cams = vision.get("cameras", {})
+        statuses = [c.get("status") for c in cams.values()]
+        connected = [bool(c.get("connected")) for c in cams.values()]
+        if not cams:
+            agg = HealthStatus.DOWN.value
+        elif not any(connected):
+            agg = HealthStatus.DOWN.value
+        elif not all(connected) or any(s in (None, "down") for s in statuses) or any(s == "degraded" for s in statuses):
+            agg = HealthStatus.DEGRADED.value
+        else:
+            agg = HealthStatus.OK.value
+        return {
+            "status": agg,
+            "description": f"{len(cams)} RTSP camera(s)",
+            "cameras_connected": sum(connected),
+            "cameras_total": len(cams),
+        }
+
     def health(self) -> dict[str, Any]:
         db_health = self.db.health()
-        cam_health = self.camera.health()
-        # Intentionally-dropped (too-old) frames are tracked by the service, not
-        # the provider; surface them alongside the provider's failed-read count so
-        # the two are never conflated on the dashboard.
-        if not self.simulation_mode:
-            cam_health = {
-                **cam_health,
-                "frames_processed": self._frames_processed,
-                "frames_dropped_stale": self._frames_dropped_stale,
-            }
+        vision: dict[str, Any] | None = None
+        if self.multi_camera_mode and self._multi_monitor is not None:
+            vision = self._multi_monitor.health()
+            cam_health = self._aggregate_camera_health(vision)
+        else:
+            cam_health = self.camera.health()
+            # Intentionally-dropped (too-old) frames are tracked by the service, not
+            # the provider; surface them alongside the provider's failed-read count so
+            # the two are never conflated on the dashboard.
+            if not self.simulation_mode:
+                cam_health = {
+                    **cam_health,
+                    "frames_processed": self._frames_processed,
+                    "frames_dropped_stale": self._frames_dropped_stale,
+                }
         wear_health = self.wearable.health()
         det_health = self._detector_health()
         disk = system_info.disk_info(self.settings.database_path, self.settings.disk_warning_percent)
@@ -562,8 +663,20 @@ class MonitoringService:
         ):
             overall = HealthStatus.DEGRADED
 
-        mode = "simulation" if self.simulation_mode else self.settings.vision_mode.value
-        return {
+        if self.multi_camera_mode:
+            mode = "rtsp_multi"
+        elif self.simulation_mode:
+            mode = "simulation"
+        else:
+            mode = self.settings.vision_mode.value
+        # In multi-camera mode there is no single state machine; report the worst
+        # (most-advanced) fall state across cameras.
+        if vision is not None:
+            states = [c.get("fall_state", "normal") for c in vision.get("cameras", {}).values()]
+            fall_state = _worst_fall_state(states)
+        else:
+            fall_state = self.state_machine.state.value
+        payload = {
             "overall": overall.value,
             "version": __version__,
             "phase": __phase__,
@@ -578,7 +691,7 @@ class MonitoringService:
             "gpu": gpu,
             "latest_frame_time": cam_health.get("last_frame_time"),
             "latest_inference_time": isoformat(self._last_inference_time),
-            "fall_state": self.state_machine.state.value,
+            "fall_state": fall_state,
             "uptime_seconds": self.uptime_seconds(),
             "disk": disk,
             "disk_warning": bool(disk.get("warning")),
@@ -591,6 +704,9 @@ class MonitoringService:
             # Whether a token is required to view the feed (NOT the token itself).
             "video_protected": self.video_token_required(),
         }
+        if vision is not None:
+            payload["vision"] = vision   # mode=rtsp_multi + per-camera (credential-free)
+        return payload
 
     def controls_enabled(self) -> bool:
         """Dev simulation controls are enabled only in development + simulation."""
@@ -767,6 +883,11 @@ class MonitoringService:
             },
         }
 
+    def _camera_status_value(self) -> str:
+        if self.multi_camera_mode and self._multi_monitor is not None:
+            return self._aggregate_camera_health(self._multi_monitor.health())["status"]
+        return self.camera.status().value
+
     def status(self) -> dict[str, Any]:
         sm = self.event_manager.status()
         lv = self._last_vital
@@ -786,7 +907,7 @@ class MonitoringService:
                 "vitals": self.repos.vitals.count(),
             },
             "latest_vital": _vital_summary(lv),
-            "camera_status": self.camera.status().value,
+            "camera_status": self._camera_status_value(),
             "detector": self._detector_health().get("name"),
             "wearable_status": self.wearable.status().value,
             "gpu_available": system_info.gpu_info().get("available", False),
@@ -794,6 +915,22 @@ class MonitoringService:
             "controls_enabled": self.controls_enabled(),
             "last_update": isoformat(self.system_clock.now()),
         }
+
+
+#: Severity ranking so multi-camera health can report the most-advanced state.
+_FALL_STATE_RANK = {
+    "normal": 0,
+    "resolved": 1,
+    "possible_fall": 2,
+    "recovering": 3,
+    "confirmed_fall": 4,
+}
+
+
+def _worst_fall_state(states: list[str]) -> str:
+    if not states:
+        return "normal"
+    return max(states, key=lambda s: _FALL_STATE_RANK.get(s, 0))
 
 
 def _vital_summary(v: VitalRow | None) -> dict[str, Any] | None:
