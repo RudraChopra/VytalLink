@@ -137,6 +137,65 @@ class AlertRow:
 
 
 @dataclass(slots=True)
+class IncidentVitalRow:
+    """One vitals snapshot tied to a confirmed fall incident (event_uid unique).
+
+    Contains only safe, normalized fields — never credentials, RTSP URLs, or raw
+    request bodies. ``reason_codes`` is a JSON-encoded list of alert reason codes.
+    """
+
+    event_uid: str
+    camera_id: str
+    confirmed_time: str | None = None
+    vitals_sample_id: str | None = None
+    heart_rate: float | None = None
+    respiratory_rate: float | None = None
+    posture: str | None = None
+    phone_alert_score: float | None = None
+    computed_alert_level: str | None = None
+    computed_alert_score: int | None = None
+    reason_codes: list[str] = field(default_factory=list)
+    source_timestamp: str | None = None
+    received_at: str | None = None
+    vitals_age_seconds: float | None = None
+    vitals_freshness: str | None = None
+    vitals_available: bool = False
+    vitals_source: str | None = None
+    synthetic: bool = False
+    snapshot_version: int = 1
+    created_at: str | None = None
+    id: int | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "IncidentVitalRow":
+        raw = row["reason_codes"]
+        try:
+            codes = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            codes = []
+        return cls(
+            id=row["id"], event_uid=row["event_uid"], camera_id=row["camera_id"],
+            confirmed_time=row["confirmed_time"], vitals_sample_id=row["vitals_sample_id"],
+            heart_rate=row["heart_rate"], respiratory_rate=row["respiratory_rate"],
+            posture=row["posture"], phone_alert_score=row["phone_alert_score"],
+            computed_alert_level=row["computed_alert_level"],
+            computed_alert_score=row["computed_alert_score"],
+            reason_codes=codes if isinstance(codes, list) else [],
+            source_timestamp=row["source_timestamp"], received_at=row["received_at"],
+            vitals_age_seconds=row["vitals_age_seconds"], vitals_freshness=row["vitals_freshness"],
+            vitals_available=bool(row["vitals_available"]), vitals_source=row["vitals_source"],
+            synthetic=bool(row["synthetic"]), snapshot_version=row["snapshot_version"],
+            created_at=row["created_at"],
+        )
+
+    def reason_codes_json(self) -> str:
+        return json.dumps(list(self.reason_codes), separators=(",", ":"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class DeviceRow:
     device_id: str
     device_type: str

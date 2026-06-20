@@ -183,6 +183,103 @@ function renderHardware(h) {
   $("hw-last-inf").textContent = fmtTime(h.latest_inference_time);
 }
 
+// --- patient state (normalized /api/patient) ------------------------------
+const REASON_LABELS = {
+  fall_confirmed: "Confirmed fall",
+  fall_suspected: "Suspected fall",
+  heart_rate_high: "High heart rate",
+  heart_rate_low: "Low heart rate",
+  respiratory_rate_high: "High respiratory rate",
+  respiratory_rate_low: "Low respiratory rate",
+  vitals_stale: "Vitals stale",
+  vitals_unavailable: "Vitals unavailable",
+  vision_unavailable: "Camera coverage unavailable",
+  person_count_ambiguous: "Multiple-person ambiguity",
+  incident_active: "Active unresolved incident",
+};
+function reasonLabel(code) { return REASON_LABELS[code] || String(code).replace(/_/g, " "); }
+
+function setAlertBadge(el, level) {
+  const map = { normal: "ok", info: "unknown", warning: "degraded", critical: "down" };
+  const cls = map[String(level || "normal").toLowerCase()] || "unknown";
+  el.className = "badge badge-" + cls;
+  el.textContent = level || "normal";   // textContent: dynamic value is escaped
+}
+function freshChipEl(state) {
+  const s = String(state || "unavailable").toLowerCase();
+  const span = document.createElement("span");
+  span.className = "chip fresh-" + s;
+  span.textContent = s;
+  return span;
+}
+function chipEl(status) {
+  const s = String(status || "unknown").toLowerCase();
+  const cls = ["ok", "degraded", "down", "disabled"].includes(s) ? s : "unknown";
+  const span = document.createElement("span");
+  span.className = "chip chip-" + cls;
+  span.textContent = s;
+  return span;
+}
+function shortUid(uid) { return uid ? String(uid).slice(0, 12) : "none"; }
+
+function renderPatient(p, h) {
+  if (!p) return;
+  $("p-version").hidden = false;
+  $("p-version").textContent = "schema v" + (p.version != null ? p.version : "?");
+  $("p-synthetic").hidden = !(h && h.synthetic_detection_mode);
+
+  const alert = p.alert || {};
+  setAlertBadge($("p-alert-level"), alert.level);
+  $("p-alert-score").textContent = alert.score != null ? "score " + alert.score + "/3" : "";
+  const reasons = $("p-reasons");
+  reasons.textContent = "";
+  const codes = alert.reasons || [];
+  if (!codes.length) {
+    const m = document.createElement("span");
+    m.className = "muted"; m.textContent = "No active reasons.";
+    reasons.appendChild(m);
+  } else {
+    codes.forEach((r) => {
+      const c = document.createElement("span");
+      c.className = "chip chip-reason"; c.textContent = reasonLabel(r);  // escaped label
+      reasons.appendChild(c);
+    });
+  }
+
+  const v = p.vitals || {}, f = p.freshness || {};
+  $("p-hr").textContent = v.heart_rate != null ? Math.round(v.heart_rate) : "—";
+  $("p-rr").textContent = v.respiratory_rate != null ? Math.round(v.respiratory_rate) : "—";
+  $("p-posture").textContent = v.posture || "—";
+  const fr = $("p-fresh");
+  fr.textContent = f.vitals || "unavailable";
+  fr.className = "vital-num value-sm fresh-" + String(f.vitals || "unavailable");
+  $("p-updated").textContent = fmtTime(v.source_timestamp);
+  $("p-age").textContent = f.vitals_age_seconds != null ? Math.round(f.vitals_age_seconds) + " s ago" : "—";
+  $("p-source").textContent = v.source || "—";
+
+  const vis = p.vision || {};
+  const vs = $("p-vision");
+  vs.textContent = String(vis.overall_state || "normal").replace(/_/g, " ");
+  vs.className = "value fall-" + (vis.overall_state || "normal");
+  const vf = $("p-vision-fresh"); vf.textContent = ""; vf.appendChild(freshChipEl(f.vision));
+  $("p-source-cam").textContent = vis.source_camera_id || "—";
+  $("p-incident").textContent = vis.active_incident_id ? shortUid(vis.active_incident_id) : "none";
+  const sn = $("p-snap"); sn.textContent = "";
+  sn.appendChild(chipEl((h && h.persistence && h.persistence.snapshot_writer) || "unknown"));
+
+  const cams = $("p-cameras");
+  cams.textContent = "";
+  Object.entries(vis.cameras || {}).forEach(([id, c]) => {
+    const row = document.createElement("div"); row.className = "device";
+    const left = document.createElement("span");
+    const pc = c.person_count != null ? " · " + c.person_count + " person(s)" : "";
+    left.textContent = id + " — " + String(c.fall_state || "normal").replace(/_/g, " ") + pc;
+    row.appendChild(left);
+    row.appendChild(freshChipEl(c.freshness));
+    cams.appendChild(row);
+  });
+}
+
 function renderStatus(s) {
   const v = s.latest_vital;
   $("v-hr").textContent = v && v.heart_rate != null ? Math.round(v.heart_rate) : "—";
@@ -279,6 +376,8 @@ async function refresh() {
     const [h, s] = await Promise.all([getJSON("/health"), getJSON("/api/status")]);
     renderHealth(h);
     renderStatus(s);
+    // Patient panel degrades independently so one bad field can't break the page.
+    try { renderPatient(await getJSON("/api/patient"), h); } catch (e) { console.error("patient render failed", e); }
     await Promise.all([renderEvents(), renderDevices()]);
     $("conn-banner").hidden = true;
   } catch (e) {

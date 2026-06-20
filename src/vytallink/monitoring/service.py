@@ -24,7 +24,7 @@ import asyncio
 import hmac
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from vytallink import __phase__, __version__
@@ -36,11 +36,16 @@ from vytallink.common.logging_setup import get_logger
 from vytallink.common.types import Frame, HealthStatus, RawDetection
 from vytallink.config import Settings, VisionMode
 from vytallink.database import Database, DeviceRow, Repositories, VitalRow
+from vytallink.database.models import IncidentVitalRow
 from vytallink.events import EventManager, FallEventStateMachine, FallState
 from vytallink.monitoring import system_info
 from vytallink.vision import build_camera, build_detector, detections_to_evidence
 from vytallink.vision.detector_simulated import Scenario, SimulatedFallDetector
 from vytallink.vision.multi_camera import build_multi_camera_monitor, make_event_bridge
+from vytallink.monitoring.alert_score import ScoreThresholds
+from vytallink.monitoring.freshness import FreshnessThresholds, camera_freshness, camera_is_fresh
+from vytallink.monitoring.incident_reconcile import classify_incident
+from vytallink.monitoring.patient_state import build_patient_state
 from vytallink.vision.evidence import FallEvidenceSmoother
 from vytallink.wearable import build_wearable
 
@@ -97,6 +102,15 @@ class MonitoringService:
             clock=self.event_clock,
             reconfirm_cooldown_seconds=settings.fall_reconfirm_cooldown_seconds,
         )
+        # Incident vitals snapshot writer: counters + a single failure-isolated
+        # callback reused by every EventManager (one snapshot per incident).
+        self._snapshot_count = 0
+        self._snapshot_failures = 0
+        self._snapshot_fn = self._make_snapshot_fn()
+        # Stale-incident reconciliation counters (surfaced in /health, no details).
+        self._incidents_reconciled = 0
+        self._reconcile_failures = 0
+        self._reconcile_ambiguous_open = 0
         self.event_manager = EventManager(
             self.repos,
             self.state_machine,
@@ -104,6 +118,7 @@ class MonitoringService:
             clock=self.event_clock,
             simulated=self.simulation_mode,
             synthetic=self.synthetic_mode,
+            snapshot_fn=self._snapshot_fn,
         )
         self.camera = build_camera(settings, clock=self.system_clock)
         self.detector = build_detector(settings, clock=self.system_clock)
@@ -180,6 +195,7 @@ class MonitoringService:
                 em = EventManager(
                     self.repos, sm, self.dispatcher,
                     clock=self.system_clock, simulated=False, synthetic=self.synthetic_mode,
+                    snapshot_fn=self._snapshot_fn,
                 )
                 self._camera_event_managers[camera_id] = em
                 return make_event_bridge(em, loop, camera_id=camera_id)
@@ -196,7 +212,11 @@ class MonitoringService:
             self._running = True
             self._connect_wearable_safe()
             await self._sample_wearable_once()
-            self._tasks = [asyncio.create_task(self._wearable_loop(), name="vytallink-wearable")]
+            await self._maybe_reconcile_on_startup()
+            self._tasks = [
+                asyncio.create_task(self._wearable_loop(), name="vytallink-wearable"),
+                asyncio.create_task(self._reconcile_loop(), name="vytallink-reconcile"),
+            ]
             log.info(
                 "MonitoringService started (mode=rtsp_multi, cameras=%d, env=%s)",
                 len(self._camera_configs), self.settings.env.value,
@@ -224,9 +244,11 @@ class MonitoringService:
         self._running = True
         # Prime one wearable reading so the dashboard has immediate data.
         await self._sample_wearable_once()
+        await self._maybe_reconcile_on_startup()
         self._tasks = [
             asyncio.create_task(self._wearable_loop(), name="vytallink-wearable"),
             asyncio.create_task(self._monitor_loop(), name="vytallink-monitor"),
+            asyncio.create_task(self._reconcile_loop(), name="vytallink-reconcile"),
         ]
         log.info(
             "MonitoringService started (mode=%s, env=%s)",
@@ -351,6 +373,269 @@ class MonitoringService:
         )
         self._last_vital = row
         self._update_device(reading.device_id, HealthStatus.OK, seen=True)
+
+    # -- iPhone vitals ingestion + normalized patient state ----------------
+    def ingest_vitals(self, payload: Any) -> tuple[VitalRow, bool]:
+        """Validate timing + store one iPhone vitals sample (a validated
+        VitalsIngest). Returns (row, idempotent). Raises ValueError on an
+        unparseable / future / too-old timestamp. Never logs values/full payload.
+
+        NOTE: there was no prior iPhone contract in this repo — POST /api/vitals
+        and this payload shape are defined here and unverified against a device.
+        """
+        now = self.system_clock.now()
+        source_ts = self._parse_source_timestamp(getattr(payload, "timestamp", None), now)
+        device_id = (getattr(payload, "device_id", None) or "iphone-1")[:64]
+        sample_id = getattr(payload, "sample_id", None)
+        rr = getattr(payload, "respiratory_rate", None)
+        posture = getattr(payload, "posture", None)
+        # Idempotency: a retried sample (same device + sample_id) is not re-stored.
+        if sample_id:
+            for existing in self.repos.vitals.list(limit=25, device_id=device_id):
+                if (existing.metadata or {}).get("sample_id") == sample_id:
+                    return existing, True
+        metadata = {
+            "source": "iphone",
+            "received_at": isoformat(now),
+            "respiratory_rate": rr,
+            "posture": posture,
+            "phone_alert_score": getattr(payload, "phone_alert_score", None),
+            "activity": getattr(payload, "motion", None),
+            "sample_id": sample_id,
+            # Which contract form the sender used (canonical vs legacy aliases) —
+            # safe metadata, no values; helps reconcile the real device later.
+            "contract_form": getattr(payload, "contract_form", "canonical"),
+        }
+        row = self.repos.vitals.insert(
+            VitalRow(
+                timestamp=isoformat(source_ts), device_id=device_id,
+                heart_rate=getattr(payload, "heart_rate", None),
+                motion=getattr(payload, "motion", None),
+                connection_quality=None, battery=getattr(payload, "battery", None),
+                simulated=False, metadata=metadata,
+            )
+        )
+        self._last_vital = row
+        signals = "+".join(
+            k for k, val in (("hr", row.heart_rate), ("rr", rr), ("motion", row.motion), ("posture", posture))
+            if val is not None
+        )
+        log.info(
+            "Ingested iPhone vitals device=%s signals=[%s] age=%.1fs",  # safe: no values
+            device_id, signals, max(0.0, (now - source_ts).total_seconds()),
+        )
+        return row, False
+
+    def _parse_source_timestamp(self, ts_str: str | None, now: datetime) -> datetime:
+        if not ts_str:
+            return now
+        try:
+            parsed = datetime.fromisoformat(str(ts_str).strip().replace("Z", "+00:00"))
+        except Exception:
+            raise ValueError("timestamp is not valid ISO-8601")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = (parsed - now).total_seconds()
+        if delta > self.settings.vitals_max_future_skew_seconds:
+            raise ValueError("timestamp is in the future")
+        if -delta > self.settings.vitals_reject_older_than_seconds:
+            raise ValueError("timestamp is too old")
+        return parsed
+
+    @staticmethod
+    def _parse_iso(s: str | None) -> datetime | None:
+        if not s:
+            return None
+        try:
+            d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    def _active_camera_ids(self) -> set[str]:
+        """Camera ids configured for the running mode (multi vs single/sim). An
+        incident whose source_device is NOT in this set is orphaned."""
+        if self.multi_camera_mode:
+            return {cfg.camera_id for cfg in self._camera_configs}
+        return {self.settings.camera_device_id}
+
+    async def _reconcile_incidents(self, trigger: str) -> dict[str, int]:
+        """Auto-resolve stale, unsupported incidents via the supported resolve
+        path (no new alert; snapshot untouched; history preserved). Idempotent.
+        A configured-but-offline source camera leaves the incident OPEN.
+
+        ``trigger`` is 'startup_reconciliation' or 'runtime'. Never raises.
+        """
+        result = {"resolved": 0, "ambiguous": 0, "failures": 0}
+        if not self.settings.incident_auto_resolve_enabled:
+            self._reconcile_ambiguous_open = 0
+            return result
+        try:
+            rows = self.db.query_all(
+                "SELECT event_uid, source_device, state, updated_at, confirmed_time "
+                "FROM events WHERE state IN ('confirmed_fall','recovering')"
+            )
+        except Exception as exc:  # pragma: no cover - defensive; never crash monitoring
+            self._reconcile_failures += 1
+            log.warning("incident reconciliation query failed: %s", type(exc).__name__)
+            return result
+
+        active_ids = self._active_camera_ids()
+        summaries = {s["id"]: s for s in self._camera_summaries()}
+        fresh_thr = FreshnessThresholds.from_settings(self.settings)
+        now = self.system_clock.now()
+        for r in rows:
+            src = r["source_device"]
+            last = self._parse_iso(r["updated_at"]) or self._parse_iso(r["confirmed_time"])
+            age = (now - last).total_seconds() if last else float("inf")
+            summary = summaries.get(src)
+            cam_fresh, cam_state = False, None
+            if summary is not None:
+                cam_state = summary.get("fall_state")
+                cam_fresh = camera_is_fresh(camera_freshness(
+                    summary.get("frame_age_seconds"), connected=bool(summary.get("connected")), t=fresh_thr))
+            resolve, reason, ambiguous = classify_incident(
+                age_seconds=age, stale_seconds=self.settings.incident_stale_seconds,
+                source_in_config=(src in active_ids), camera_fresh=cam_fresh, camera_fall_state=cam_state,
+            )
+            if ambiguous:
+                result["ambiguous"] += 1
+            if not resolve:
+                continue
+            try:
+                await self.event_manager.resolve_event(
+                    r["event_uid"], note=f"auto-reconciled[{trigger}]: {reason}"
+                )
+                self._incidents_reconciled += 1
+                result["resolved"] += 1
+                log.info("incident reconciled event=%s trigger=%s reason=%s", r["event_uid"], trigger, reason)
+            except Exception as exc:  # isolation: a resolve failure never crashes monitoring
+                self._reconcile_failures += 1
+                result["failures"] += 1
+                log.warning("incident reconcile failed for %s: %s", r["event_uid"], type(exc).__name__)
+        self._reconcile_ambiguous_open = result["ambiguous"]
+        return result
+
+    async def _maybe_reconcile_on_startup(self) -> None:
+        if self.settings.incident_reconcile_on_startup:
+            res = await self._reconcile_incidents("startup_reconciliation")
+            log.info("startup incident reconciliation: %s", res)
+
+    async def _reconcile_loop(self) -> None:
+        interval = max(5.0, self.settings.incident_reconcile_interval_seconds)
+        try:
+            while self._running:
+                await asyncio.sleep(interval)
+                await self._reconcile_incidents("runtime")
+        except asyncio.CancelledError:  # pragma: no cover - shutdown
+            raise
+
+    def _active_incident_id(self) -> str | None:
+        """Most recent unresolved incident (confirmed/recovering), or None."""
+        try:
+            row = self.db.query_one(
+                "SELECT event_uid FROM events WHERE state IN ('confirmed_fall','recovering') "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return row["event_uid"] if row else None
+
+    def _camera_summaries(self) -> list[dict[str, Any]]:
+        """Per-camera primitives for patient-state aggregation (mode-agnostic)."""
+        out: list[dict[str, Any]] = []
+        if self.multi_camera_mode and self._multi_monitor is not None:
+            for cid, c in self._multi_monitor.health().get("cameras", {}).items():
+                age_ms = c.get("last_frame_age_ms")
+                out.append({
+                    "id": cid, "connected": bool(c.get("connected")),
+                    "fall_state": c.get("fall_state", "normal"),
+                    "frame_age_seconds": (age_ms / 1000.0) if age_ms is not None else None,
+                    "person_count": c.get("person_count"), "fall_confidence": None,
+                })
+        else:
+            ch = self.camera.health()
+            age = ch.get("last_frame_age_seconds")
+            if self.simulation_mode and age is None:
+                age = 0.0  # simulation synthesizes frames continuously -> fresh
+            out.append({
+                "id": self.settings.camera_device_id,
+                "connected": bool(ch.get("opened", self.simulation_mode)),
+                "fall_state": self.state_machine.state.value,
+                "frame_age_seconds": age, "person_count": None,
+                "fall_confidence": self._last_evidence_score or None,
+            })
+        return out
+
+    # -- incident vitals snapshot (one per confirmed incident) -------------
+    def _make_snapshot_fn(self):
+        """A failure-isolated callback that captures one vitals snapshot when an
+        incident is first confirmed. Runs on the event loop (same thread as all
+        DB writes); never raises into observe/persistence/the camera worker."""
+
+        def snapshot(event: Any) -> None:
+            try:
+                self._write_incident_snapshot(event)
+            except Exception as exc:  # isolation: snapshot errors never propagate
+                self._snapshot_failures += 1
+                log.warning(
+                    "incident snapshot failed for %s: %s",
+                    getattr(event, "event_uid", "?"), type(exc).__name__,
+                )
+
+        return snapshot
+
+    def _write_incident_snapshot(self, event: Any) -> None:
+        ps = self.patient_state()
+        vit, alert = ps["vitals"], ps["alert"]
+        v = self.repos.vitals.latest()
+        sample_id = (v.metadata or {}).get("sample_id") if v is not None else None
+        confirmed = getattr(event, "confirmed_time", None)
+        snap = IncidentVitalRow(
+            event_uid=event.event_uid,
+            camera_id=getattr(event, "source_device", None) or self.settings.camera_device_id,
+            confirmed_time=isoformat(confirmed) if confirmed else None,
+            vitals_sample_id=sample_id,
+            heart_rate=vit.get("heart_rate"),
+            respiratory_rate=vit.get("respiratory_rate"),
+            posture=vit.get("posture"),
+            phone_alert_score=vit.get("phone_alert_score"),
+            computed_alert_level=alert.get("level"),
+            computed_alert_score=alert.get("score"),
+            reason_codes=list(alert.get("reasons", [])),
+            source_timestamp=vit.get("source_timestamp"),
+            received_at=vit.get("received_at"),
+            vitals_age_seconds=vit.get("age_seconds"),
+            vitals_freshness=vit.get("freshness"),
+            # Available = a vital exists and is not so old it's "unavailable".
+            vitals_available=(v is not None and vit.get("freshness") != "unavailable"),
+            vitals_source=vit.get("source"),
+            synthetic=self.synthetic_mode,
+        )
+        _row, created = self.repos.incident_vitals.create(snap)
+        if created:
+            self._snapshot_count += 1
+            log.info(
+                "incident snapshot stored event=%s camera=%s vitals_freshness=%s available=%s synthetic=%s",
+                snap.event_uid, snap.camera_id, snap.vitals_freshness, snap.vitals_available, snap.synthetic,
+            )
+
+    def patient_state(self) -> dict[str, Any]:
+        """Normalized patient state: latest vitals + per-camera fall state +
+        freshness + informational alert score (raw vs computed distinguishable)."""
+        now = self.system_clock.now()
+        v = self.repos.vitals.latest()
+        source_ts = received_at = None
+        if v is not None:
+            source_ts = self._parse_iso(v.timestamp)
+            md = v.metadata or {}
+            received_at = self._parse_iso(md.get("received_at") or v.created_at)
+        return build_patient_state(
+            now=now, vital=v, received_at=received_at, source_timestamp=source_ts,
+            cameras=self._camera_summaries(), active_incident_id=self._active_incident_id(),
+            fresh_thr=FreshnessThresholds.from_settings(self.settings),
+            score_thr=ScoreThresholds.from_settings(self.settings),
+        )
 
     async def _monitor_loop(self) -> None:
         if self.simulation_mode:
@@ -674,6 +959,9 @@ class MonitoringService:
             or disk.get("warning")
             or det_status == HealthStatus.DEGRADED.value
             or (live and cam_health["status"] == HealthStatus.DEGRADED.value)
+            # An ambiguous open incident (source camera offline) needs attention.
+            or self._reconcile_ambiguous_open > 0
+            or self._reconcile_failures > 0
         ):
             overall = HealthStatus.DEGRADED
 
@@ -721,6 +1009,7 @@ class MonitoringService:
         payload["model"] = self._model_block(det_health)
         payload["startup"] = self._startup_block()
         payload["synthetic_detection_mode"] = self.synthetic_mode
+        payload["persistence"] = self._persistence_block()
         if vision is not None:
             payload["vision"] = vision   # mode=rtsp_multi + per-camera (credential-free)
         return payload
@@ -755,6 +1044,25 @@ class MonitoringService:
             "load_count": self._model_load_count(),
             "warmup_complete": det.get("warmup_ms") is not None,
             "last_error": last_error,
+        }
+
+    def _persistence_block(self) -> dict[str, Any]:
+        """Event/snapshot writer health (no patient values — counts only)."""
+        try:
+            total = self.repos.incident_vitals.count()
+        except Exception:  # pragma: no cover - defensive
+            total = None
+        return {
+            "snapshot_writer": HealthStatus.DEGRADED.value if self._snapshot_failures else HealthStatus.OK.value,
+            "snapshots_written": self._snapshot_count,
+            "snapshot_failures": self._snapshot_failures,
+            "incident_snapshots_total": total,
+            "reconciliation": {
+                "auto_resolve_enabled": self.settings.incident_auto_resolve_enabled,
+                "incidents_reconciled": self._incidents_reconciled,
+                "reconcile_failures": self._reconcile_failures,
+                "open_ambiguous": self._reconcile_ambiguous_open,
+            },
         }
 
     def _startup_block(self) -> dict[str, Any]:

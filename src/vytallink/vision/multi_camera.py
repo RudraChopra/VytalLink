@@ -100,6 +100,7 @@ class CameraWorker:
         self._read_ms: deque[float] = deque(maxlen=512)
         self._infer_ms: deque[float] = deque(maxlen=512)
         self._class_counts: Counter[str] = Counter()
+        self._last_person_count: int | None = None  # detections in the last processed frame
         self._events: list[dict[str, Any]] = []   # confirmed-fall event history
 
     # -- lifecycle ---------------------------------------------------------
@@ -174,6 +175,8 @@ class CameraWorker:
             self._infer_ms.append(infer_ms)
             for d in detections:
                 self._class_counts[d.class_name] += 1
+        # Per-frame person count ≈ number of posture detections (best-effort).
+        self._last_person_count = len(detections)
         self._processed += 1
 
         evidence, confidence = detections_to_evidence(
@@ -218,6 +221,7 @@ class CameraWorker:
             "backlog": self._inflight,                            # frames awaiting inference (0/1)
             "fall_state": self.sm.state.value,
             "confirmed_falls": self._confirmed_falls,
+            "person_count": self._last_person_count,
             "detected_classes": classes,
             "read_ms_avg": _avg(read),
             "read_ms_p95": _pct(read, 95),

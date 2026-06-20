@@ -160,3 +160,43 @@ def test_base_read_wraps_grabbed_frame():
     assert frame.width == 640 and frame.height == 480
     assert frame.image is not None
     cam.close()
+
+
+# --- transient-empty tolerance (flaky-link reconnect resilience) -----------
+def _grabloop_cam(**over):
+    # Real (system) clock so the time-based grace fires; short grace so the loop
+    # terminates fast. No real RTSP — _grab_loop is driven with a FakeCapture.
+    return RTSPCamera("rtsp://user:s3cret@cam.local:554/stream1", source_id="cam",
+                      grab_failure_grace_seconds=over.get("grace", 0.05),
+                      grab_max_transient_failures=over.get("max_fail", 100))
+
+
+def test_grabber_rides_through_a_transient_empty_frame():
+    cam = _grabloop_cam()
+    cap = FakeCapture([_frame(1), _frame(2), None, _frame(3), _frame(4)])  # one transient empty
+    cam._cap = cap
+    cam._grab_generation = 1
+    cam._grab_loop(cap, 1)
+    # Did NOT break on the middle empty: all four real frames were grabbed.
+    assert cam._frames_grabbed == 4
+    assert cap.released
+
+
+def test_grabber_breaks_on_sustained_failure():
+    cam = _grabloop_cam(grace=0.05)
+    cap = FakeCapture([])  # stream dead — always (False, None)
+    cam._cap = cap
+    cam._grab_generation = 1
+    cam._grab_loop(cap, 1)   # must terminate via the grace bound, not hang
+    assert cam._frames_grabbed == 0
+    assert cap.released
+
+
+def test_grabber_count_bound_terminates_even_without_clock_advance():
+    cam = _grabloop_cam(grace=9999.0, max_fail=3)  # huge grace -> count bound must fire
+    cap = FakeCapture([])
+    cam._cap = cap
+    cam._grab_generation = 1
+    cam._grab_loop(cap, 1)
+    assert cam._frames_grabbed == 0
+    assert cap.released

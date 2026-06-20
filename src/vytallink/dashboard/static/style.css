@@ -125,3 +125,15 @@ footer {
   .topbar h1 { font-size: 1.1rem; }
   footer { flex-direction: column; gap: 4px; }
 }
+
+/* --- Patient panel: freshness states (stale is visually distinct, never green) --- */
+.fresh-fresh        { background: rgba(63,185,80,0.18);  color: var(--ok); }
+.fresh-aging        { background: rgba(210,153,34,0.18); color: var(--warn); }
+.fresh-stale        { background: rgba(248,81,73,0.18);  color: var(--down); }
+.fresh-unavailable,
+.fresh-offline      { background: rgba(139,152,165,0.18); color: var(--muted); }
+.chip-reason        { background: rgba(88,166,255,0.16); color: var(--info); margin: 2px 4px 2px 0; }
+.reasons            { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+.patient-alert      { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.subhead            { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; margin: 14px 0 6px; }
+.badge-down         { background: rgba(248,81,73,0.18); color: var(--down); }

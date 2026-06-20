@@ -49,6 +49,39 @@
       <div id="warnings" class="warnings"></div>
     </section>
 
+    <!-- Patient status (iPhone vitals + multimodal alert + vision aggregation) -->
+    <section class="card" id="patient-card">
+      <h2>Patient status
+        <span id="p-version" class="tag" hidden></span>
+        <span id="p-synthetic" class="tag tag-dev" hidden>SYNTHETIC TEST</span>
+      </h2>
+      <p class="muted">Informational only — not a medical assessment. Stale or missing data is never shown as “normal”.</p>
+      <div class="patient-alert">
+        <span class="label">Alert level</span>
+        <span id="p-alert-level" class="badge badge-unknown">—</span>
+        <span id="p-alert-score" class="muted"></span>
+      </div>
+      <div id="p-reasons" class="reasons"></div>
+      <div class="grid grid-vitals">
+        <div class="vital"><span class="vital-num" id="p-hr">—</span><span class="vital-unit">bpm</span><span class="label">Heart rate</span></div>
+        <div class="vital"><span class="vital-num" id="p-rr">—</span><span class="vital-unit">breaths/min</span><span class="label">Respiratory</span></div>
+        <div class="vital"><span class="vital-num value-sm" id="p-posture">—</span><span class="vital-unit">posture</span><span class="label">Phone posture</span></div>
+        <div class="vital"><span class="vital-num value-sm" id="p-fresh">—</span><span class="vital-unit">vitals</span><span class="label">Freshness</span></div>
+      </div>
+      <div class="grid">
+        <div class="stat"><span class="label">Vitals updated</span><span id="p-updated" class="value value-sm">—</span></div>
+        <div class="stat"><span class="label">Sample age</span><span id="p-age" class="value">—</span></div>
+        <div class="stat"><span class="label">Vitals source</span><span id="p-source" class="value">—</span></div>
+        <div class="stat"><span class="label">Vision state</span><span id="p-vision" class="value">—</span></div>
+        <div class="stat"><span class="label">Vision freshness</span><span id="p-vision-fresh" class="value">—</span></div>
+        <div class="stat"><span class="label">Source camera</span><span id="p-source-cam" class="value">—</span></div>
+        <div class="stat"><span class="label">Active incident</span><span id="p-incident" class="value value-sm">—</span></div>
+        <div class="stat"><span class="label">Snapshot writer</span><span id="p-snap" class="value">—</span></div>
+      </div>
+      <h3 class="subhead">Per-camera</h3>
+      <div id="p-cameras" class="devices"></div>
+    </section>
+
     <!-- Hardware (camera + detector + GPU) -->
     <section class="card" id="hardware-card">
       <h2>Hardware <span id="hw-mode" class="tag">—</span></h2>

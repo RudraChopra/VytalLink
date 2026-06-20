@@ -44,12 +44,22 @@ class RTSPCamera(CameraProvider):
         *,
         open_timeout_us: int = 5_000_000,
         grab: bool = True,
+        grab_failure_grace_seconds: float = 1.0,
+        grab_max_transient_failures: int = 30,
         **kw,
     ):
         super().__init__(source_id, **kw)
         self._conn = connection_string  # may contain credentials; never log raw
         self.open_timeout_us = open_timeout_us
         self._use_grabber = grab
+        # Tolerate brief, transient empty reads (a flaky Wi-Fi link drops the odd
+        # frame) before tearing the grabber down — a single empty frame must not
+        # trigger an expensive full reconnect. Bounded by BOTH time and count, and
+        # kept below stale_timeout so the consumer still sees the latest frame
+        # during the grace window. A sustained stall (stream genuinely dead) still
+        # tears down and reconnects, so a truly-offline camera is never hidden.
+        self._grab_failure_grace_seconds = float(grab_failure_grace_seconds)
+        self._grab_max_transient_failures = int(grab_max_transient_failures)
         self._cap: Any = None
 
         # grabber state (guarded by _grab_lock)
@@ -168,10 +178,31 @@ class RTSPCamera(CameraProvider):
         # Bound to (cap, gen): exits as soon as it is superseded or stopped, and
         # ALWAYS releases its OWN capture — never a capture owned by a newer
         # connection. This is what makes reconnects free of use-after-free.
+        #
+        # A single empty read no longer tears the grabber down: transient empty
+        # frames (common on a flaky RTSP link) are tolerated for a brief grace
+        # window so they do not trigger an expensive full reconnect. Only a
+        # SUSTAINED failure (grace exceeded or too many in a row) breaks out and
+        # lets the base class reconnect — so a genuinely dead stream still fails.
+        fail_streak = 0
+        first_fail_mono: float | None = None
         try:
             while gen == self._grab_generation and not self._grab_stop.is_set():
-                if not self._grab_once(cap, gen):
-                    break
+                if self._grab_once(cap, gen):
+                    fail_streak = 0
+                    first_fail_mono = None
+                    continue
+                now = self.clock.monotonic()
+                if first_fail_mono is None:
+                    first_fail_mono = now
+                fail_streak += 1
+                if (
+                    fail_streak >= self._grab_max_transient_failures
+                    or (now - first_fail_mono) >= self._grab_failure_grace_seconds
+                ):
+                    break  # sustained failure -> tear down; base class reconnects
+                # Brief pause so an immediately-returning empty read does not spin.
+                self._grab_stop.wait(0.02)
         finally:
             try:
                 cap.release()

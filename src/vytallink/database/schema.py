@@ -9,7 +9,7 @@ preserved across restarts and upgrades.
 
 from __future__ import annotations
 
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 # --- Version 1: initial schema --------------------------------------------
 
@@ -91,7 +91,41 @@ _V1_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_devices_type ON devices(device_type)",
 )
 
+# v2: one vitals snapshot per confirmed fall incident (additive, backward-compatible).
+# UNIQUE(event_uid) enforces exactly one snapshot per logical incident at the DB
+# layer. No credentials, RTSP URLs, or raw payloads are ever stored here.
+_V2_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS incident_vitals (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_uid            TEXT    NOT NULL UNIQUE,
+        camera_id            TEXT    NOT NULL,
+        confirmed_time       TEXT,
+        vitals_sample_id     TEXT,
+        heart_rate           REAL,
+        respiratory_rate     REAL,
+        posture              TEXT,
+        phone_alert_score    REAL,
+        computed_alert_level TEXT,
+        computed_alert_score INTEGER,
+        reason_codes         TEXT,
+        source_timestamp     TEXT,
+        received_at          TEXT,
+        vitals_age_seconds   REAL,
+        vitals_freshness     TEXT,
+        vitals_available     INTEGER NOT NULL DEFAULT 0,
+        vitals_source        TEXT,
+        synthetic            INTEGER NOT NULL DEFAULT 0,
+        snapshot_version     INTEGER NOT NULL DEFAULT 1,
+        created_at           TEXT    NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_incident_vitals_camera ON incident_vitals(camera_id)",
+    "CREATE INDEX IF NOT EXISTS idx_incident_vitals_created ON incident_vitals(created_at)",
+)
+
 # Ordered migrations: (target_version, tuple_of_sql_statements).
 MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (1, _V1_STATEMENTS),
+    (2, _V2_STATEMENTS),
 )
