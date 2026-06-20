@@ -52,3 +52,31 @@ def test_static_js_served(client):
     r = client.get("/static/app.js")
     assert r.status_code == 200
     assert "VytalLink dashboard" in r.text
+
+
+def test_dashboard_has_patient_panel(client):
+    body = client.get("/").text
+    # Patient panel elements present for vitals, alert, freshness, vision, incident.
+    for el in ("patient-card", "p-alert-level", "p-reasons", "p-hr", "p-rr",
+               "p-fresh", "p-vision", "p-source-cam", "p-incident", "p-cameras", "p-snap"):
+        assert el in body, f"missing dashboard element: {el}"
+    assert "not a medical assessment" in body
+
+
+def test_dashboard_js_is_xss_safe_and_uses_canonical_endpoint(client):
+    js = client.get("/static/app.js").text
+    assert "renderPatient" in js
+    assert "/api/patient" in js                  # uses the backend's normalized state
+    # Reason codes are rendered as textContent (escaped), never injected as HTML.
+    assert "c.textContent = reasonLabel(r)" in js
+    assert "reasons.innerHTML" not in js
+
+
+def test_patient_panel_data_available_through_api(client):
+    client.post("/api/vitals", json={"heart_rate": 72, "respiratory_rate": 16})
+    p = client.get("/api/patient").json()
+    # Everything the dashboard renders is present + credential-free.
+    assert {"version", "vitals", "vision", "freshness", "alert"} <= set(p)
+    assert p["vitals"]["heart_rate"] == 72
+    blob = client.get("/api/patient").text
+    assert "password" not in blob.lower() and "rtsp://" not in blob

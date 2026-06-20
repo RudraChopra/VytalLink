@@ -22,6 +22,10 @@ from vytallink.monitoring.freshness import (
     vitals_is_usable,
 )
 
+#: Normalized patient-state schema version. Bump when the structure changes so
+#: clients (dashboard, future phone integrations) can adapt without guessing.
+PATIENT_STATE_VERSION = 1
+
 #: Fall-state severity (low -> high) for worst-of aggregation across cameras.
 _FALL_RANK = {"normal": 0, "resolved": 1, "possible_fall": 2, "recovering": 3, "confirmed_fall": 4}
 
@@ -148,6 +152,7 @@ def build_patient_state(
     )
 
     return {
+        "version": PATIENT_STATE_VERSION,              # patient-state schema version
         "generated_at": isoformat(now),               # processing timestamp
         "not_a_diagnosis": True,                       # the score is informational only
         "vitals": vitals_block,                        # RAW

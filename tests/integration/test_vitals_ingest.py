@@ -132,6 +132,42 @@ def test_latest_and_canonical_share_data_and_keep_legacy_fields(client):
     assert "password" not in blob.lower() and "rtsp://" not in blob and "Traceback" not in blob
 
 
+# --- compatibility adapter (aliases, conflicts, contract form) -------------
+def test_conflicting_aliases_rejected(client):
+    # heart_rate and hr present with DIFFERENT values -> 422.
+    r = client.post("/api/vitals", json={"heart_rate": 72, "hr": 80})
+    assert r.status_code == 422
+
+
+def test_same_value_aliases_not_a_conflict(client):
+    assert client.post("/api/vitals", json={"heart_rate": 72, "hr": 72}).status_code == 200
+
+
+def test_new_aliases_br_and_timestamp_variants(client):
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    r = client.post("/api/vitals", json={"hr": 70, "br": 14, "recorded_at": now_iso})
+    assert r.status_code == 200
+    assert client.get("/api/vitals/latest").json()["vital"]["respiratory_rate"] == 14
+
+
+def test_boolean_as_number_rejected(client):
+    assert client.post("/api/vitals", json={"heart_rate": True}).status_code == 422
+
+
+def test_contract_form_reported(client):
+    canon = client.post("/api/vitals", json={"heart_rate": 72}).json()
+    alias = client.post("/api/vitals", json={"hr": 72}).json()
+    assert canon["contract_form"] == "canonical"
+    assert alias["contract_form"] == "alias"
+    assert "heart_rate" in canon["accepted_fields"]
+
+
+def test_patient_state_has_version(client):
+    client.post("/api/vitals", json={"heart_rate": 72})
+    assert client.get("/api/patient").json()["version"] == 1
+
+
 # --- failure isolation -----------------------------------------------------
 def test_malformed_request_does_not_break_monitoring(client):
     assert client.post("/api/vitals", json={"heart_rate": "bad"}).status_code == 422

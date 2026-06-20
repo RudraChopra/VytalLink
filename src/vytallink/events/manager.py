@@ -16,7 +16,7 @@ remains synchronous and independently testable.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 from vytallink.alerts.base import AlertDispatcherProtocol, AlertEvent
 from vytallink.common.clock import Clock, SystemClock, isoformat
@@ -43,6 +43,7 @@ class EventManager:
         clock: Clock | None = None,
         simulated: bool = True,
         synthetic: bool = False,
+        snapshot_fn: Callable[[Any], None] | None = None,
     ) -> None:
         self.repos = repos
         self.sm = state_machine
@@ -52,6 +53,10 @@ class EventManager:
         # When True, persisted events are tagged event_type='fall_synthetic' so a
         # forced/validation fall is never mistaken for a real one.
         self.synthetic = synthetic
+        # Called exactly once, with the new event, when an incident is first
+        # CONFIRMED — to persist a vitals snapshot. Failure-isolated here AND in
+        # the callback, so a snapshot error can never break observe/persistence.
+        self._snapshot_fn = snapshot_fn
         self._lock = asyncio.Lock()
         self.last_alert_results: list = []
 
@@ -99,6 +104,14 @@ class EventManager:
                     source_device=ev.source_device,
                 )
             )
+            # One vitals snapshot per incident, at first confirmation only. Never
+            # let a snapshot failure break observe/persistence (also isolated in
+            # the callback itself).
+            if self._snapshot_fn is not None:
+                try:
+                    self._snapshot_fn(ev)
+                except Exception as exc:  # pragma: no cover - defensive double guard
+                    log.warning("incident snapshot hook failed for %s: %s", ev.event_uid, type(exc).__name__)
         else:
             self.repos.events.update(
                 ev.event_uid,

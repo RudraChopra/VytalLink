@@ -36,6 +36,7 @@ from vytallink.common.logging_setup import get_logger
 from vytallink.common.types import Frame, HealthStatus, RawDetection
 from vytallink.config import Settings, VisionMode
 from vytallink.database import Database, DeviceRow, Repositories, VitalRow
+from vytallink.database.models import IncidentVitalRow
 from vytallink.events import EventManager, FallEventStateMachine, FallState
 from vytallink.monitoring import system_info
 from vytallink.vision import build_camera, build_detector, detections_to_evidence
@@ -100,6 +101,11 @@ class MonitoringService:
             clock=self.event_clock,
             reconfirm_cooldown_seconds=settings.fall_reconfirm_cooldown_seconds,
         )
+        # Incident vitals snapshot writer: counters + a single failure-isolated
+        # callback reused by every EventManager (one snapshot per incident).
+        self._snapshot_count = 0
+        self._snapshot_failures = 0
+        self._snapshot_fn = self._make_snapshot_fn()
         self.event_manager = EventManager(
             self.repos,
             self.state_machine,
@@ -107,6 +113,7 @@ class MonitoringService:
             clock=self.event_clock,
             simulated=self.simulation_mode,
             synthetic=self.synthetic_mode,
+            snapshot_fn=self._snapshot_fn,
         )
         self.camera = build_camera(settings, clock=self.system_clock)
         self.detector = build_detector(settings, clock=self.system_clock)
@@ -183,6 +190,7 @@ class MonitoringService:
                 em = EventManager(
                     self.repos, sm, self.dispatcher,
                     clock=self.system_clock, simulated=False, synthetic=self.synthetic_mode,
+                    snapshot_fn=self._snapshot_fn,
                 )
                 self._camera_event_managers[camera_id] = em
                 return make_event_bridge(em, loop, camera_id=camera_id)
@@ -383,6 +391,9 @@ class MonitoringService:
             "phone_alert_score": getattr(payload, "phone_alert_score", None),
             "activity": getattr(payload, "motion", None),
             "sample_id": sample_id,
+            # Which contract form the sender used (canonical vs legacy aliases) —
+            # safe metadata, no values; helps reconcile the real device later.
+            "contract_form": getattr(payload, "contract_form", "canonical"),
         }
         row = self.repos.vitals.insert(
             VitalRow(
@@ -466,6 +477,59 @@ class MonitoringService:
                 "fall_confidence": self._last_evidence_score or None,
             })
         return out
+
+    # -- incident vitals snapshot (one per confirmed incident) -------------
+    def _make_snapshot_fn(self):
+        """A failure-isolated callback that captures one vitals snapshot when an
+        incident is first confirmed. Runs on the event loop (same thread as all
+        DB writes); never raises into observe/persistence/the camera worker."""
+
+        def snapshot(event: Any) -> None:
+            try:
+                self._write_incident_snapshot(event)
+            except Exception as exc:  # isolation: snapshot errors never propagate
+                self._snapshot_failures += 1
+                log.warning(
+                    "incident snapshot failed for %s: %s",
+                    getattr(event, "event_uid", "?"), type(exc).__name__,
+                )
+
+        return snapshot
+
+    def _write_incident_snapshot(self, event: Any) -> None:
+        ps = self.patient_state()
+        vit, alert = ps["vitals"], ps["alert"]
+        v = self.repos.vitals.latest()
+        sample_id = (v.metadata or {}).get("sample_id") if v is not None else None
+        confirmed = getattr(event, "confirmed_time", None)
+        snap = IncidentVitalRow(
+            event_uid=event.event_uid,
+            camera_id=getattr(event, "source_device", None) or self.settings.camera_device_id,
+            confirmed_time=isoformat(confirmed) if confirmed else None,
+            vitals_sample_id=sample_id,
+            heart_rate=vit.get("heart_rate"),
+            respiratory_rate=vit.get("respiratory_rate"),
+            posture=vit.get("posture"),
+            phone_alert_score=vit.get("phone_alert_score"),
+            computed_alert_level=alert.get("level"),
+            computed_alert_score=alert.get("score"),
+            reason_codes=list(alert.get("reasons", [])),
+            source_timestamp=vit.get("source_timestamp"),
+            received_at=vit.get("received_at"),
+            vitals_age_seconds=vit.get("age_seconds"),
+            vitals_freshness=vit.get("freshness"),
+            # Available = a vital exists and is not so old it's "unavailable".
+            vitals_available=(v is not None and vit.get("freshness") != "unavailable"),
+            vitals_source=vit.get("source"),
+            synthetic=self.synthetic_mode,
+        )
+        _row, created = self.repos.incident_vitals.create(snap)
+        if created:
+            self._snapshot_count += 1
+            log.info(
+                "incident snapshot stored event=%s camera=%s vitals_freshness=%s available=%s synthetic=%s",
+                snap.event_uid, snap.camera_id, snap.vitals_freshness, snap.vitals_available, snap.synthetic,
+            )
 
     def patient_state(self) -> dict[str, Any]:
         """Normalized patient state: latest vitals + per-camera fall state +
@@ -853,6 +917,7 @@ class MonitoringService:
         payload["model"] = self._model_block(det_health)
         payload["startup"] = self._startup_block()
         payload["synthetic_detection_mode"] = self.synthetic_mode
+        payload["persistence"] = self._persistence_block()
         if vision is not None:
             payload["vision"] = vision   # mode=rtsp_multi + per-camera (credential-free)
         return payload
@@ -887,6 +952,19 @@ class MonitoringService:
             "load_count": self._model_load_count(),
             "warmup_complete": det.get("warmup_ms") is not None,
             "last_error": last_error,
+        }
+
+    def _persistence_block(self) -> dict[str, Any]:
+        """Event/snapshot writer health (no patient values — counts only)."""
+        try:
+            total = self.repos.incident_vitals.count()
+        except Exception:  # pragma: no cover - defensive
+            total = None
+        return {
+            "snapshot_writer": HealthStatus.DEGRADED.value if self._snapshot_failures else HealthStatus.OK.value,
+            "snapshots_written": self._snapshot_count,
+            "snapshot_failures": self._snapshot_failures,
+            "incident_snapshots_total": total,
         }
 
     def _startup_block(self) -> dict[str, Any]:

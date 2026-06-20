@@ -105,10 +105,82 @@ keeps external alerts in dry-run (see docs/apple_silicon_startup.md).
 Scenarios: `normal`, `high_hr`, `low_hr`, `resp`, `lying`, `minimal`, `stale`,
 `duplicate`, `malformed`. Localhost by default; `--url` to target another host.
 
-## Deferred (not in this change)
+## Compatibility adapter (aliases + conflicts)
 
-- **Incident vitals snapshot** (persisting the vitals at fall-confirmation time)
-  is not yet implemented — the alert/patient view is live, but a fall incident
-  does not yet store a point-in-time vitals snapshot.
-- **Dashboard** still renders the existing health view; the new patient-state
-  fields are exposed via the API but not yet surfaced in the dashboard UI.
+A small, documented alias set is normalized into the canonical model — it is NOT
+an unbounded permissive parser. Accepted aliases:
+
+| canonical | accepted input keys |
+|-----------|---------------------|
+| `heart_rate` | `heart_rate`, `hr`, `bpm` |
+| `respiratory_rate` | `respiratory_rate`, `rr`, `breathing_rate`, `resp_rate`, `br` |
+| `motion` | `motion`, `activity`, `activity_level` |
+| `phone_alert_score` | `phone_alert_score`, `alert_score` |
+| `timestamp` | `timestamp`, `time`, `ts`, `source_timestamp`, `device_timestamp`, `recorded_at` |
+| `sample_id` | `sample_id`, `id` |
+
+- **Conflicting aliases with different values are rejected** (e.g. `heart_rate:72`
+  + `hr:80` → 422); identical values are fine. Units are never guessed.
+  Booleans-as-numbers are rejected. Unknown keys are ignored (not nested-parsed).
+- The ingest response reports `contract_form` (`canonical`/`alias`) and
+  `accepted_fields`; the stored vital records `contract_form` in metadata to help
+  reconcile the real device later.
+
+## Patient-state schema version
+
+`/api/patient` and the embedded sections carry `"version"` (currently `1`). Bump
+it when the structure changes so the dashboard / future phone integrations can
+adapt without guessing. Legacy top-level `vital`/`simulated` fields are unaffected.
+
+## Incident vitals snapshot
+
+On the **first** confirmation of a fall incident, exactly one vitals snapshot is
+persisted to the `incident_vitals` table (UNIQUE on `event_uid` — one per
+incident). It captures: camera id, confirmation time, latest vitals sample id,
+heart/respiratory rate, posture, phone + computed alert score, alert level +
+reason codes, source & received timestamps, vitals age, freshness, availability,
+source (`iphone`/`simulator`/`wearable`), and a `synthetic` marker. It stores no
+credentials, RTSP URLs, or raw payloads.
+
+- One snapshot per incident; ongoing confirmed frames create no duplicates.
+- A resolved-then-new fall (or an independent camera) creates a new snapshot.
+- No recent vitals → snapshot still created, marked `vitals_available=false` /
+  freshness `unavailable` (never invented normal values).
+- Snapshot-writer failures are isolated (never crash the camera worker/observe)
+  and surfaced in `/health.persistence` (`snapshot_writer`, counts).
+- The snapshot is exposed on `GET /api/events/{id}` as `incident_vitals`.
+- Migration is additive (schema v2), idempotent, and preserves existing events.
+- **Limitation:** no cross-camera identity correlation — two cameras viewing the
+  same physical area produce two independent incidents/snapshots (by design).
+
+## Dashboard
+
+A **Patient status** panel (fed by the canonical `/api/patient`, no competing JS
+logic) shows: alert level + plain-language reason labels, heart/respiratory rate
+(bpm / breaths/min), posture, vitals freshness + sample age, per-camera fall
+state + freshness, source camera, active incident, and snapshot-writer health.
+Freshness is colour- AND text-coded; **stale/unavailable data is shown in
+amber/red, never as a reassuring green "normal"**. Dynamic values are rendered
+with `textContent` (escaped); reason codes are never injected as HTML. The panel
+degrades independently so one bad field cannot break the page.
+
+## Real-device reconciliation (the contract is still unverified)
+
+> **The local simulator verifies the VytalLink API contract. It does NOT prove
+> the current real iPhone sender uses the same payload.**
+
+To reconcile when a real payload is available:
+1. Capture one real payload from the phone (developer, with consent).
+2. Remove names, identifiers, and any PHI you don't need.
+3. Save it as JSON and run
+   `./.venv/bin/python scripts/validate_vitals_fixture.py payload.json`
+   (prints field names/types/contract form — never values).
+4. If fields are unmapped, add aliases to `api/schemas.VITALS_ALIASES` deliberately.
+5. Add the sanitized fixture under `tests/` and re-run the suite.
+
+## Privacy
+
+Only normalized vitals are stored; full request bodies are never persisted or
+logged (only a safe summary: device + which signals + age). `/health` reports
+status + freshness classification + safe counts — never patient vitals values.
+Snapshots store no credentials/URLs/raw payloads.

@@ -10,7 +10,7 @@ from typing import Any
 
 from vytallink.common.errors import DatabaseError, NotFoundError
 from vytallink.database.db import Database
-from vytallink.database.models import AlertRow, DeviceRow, EventRow, VitalRow
+from vytallink.database.models import AlertRow, DeviceRow, EventRow, IncidentVitalRow, VitalRow
 
 
 class EventRepository:
@@ -318,6 +318,62 @@ class DeviceRepository:
         return [DeviceRow.from_row(r) for r in rows]
 
 
+class IncidentVitalRepository:
+    """One vitals snapshot per confirmed incident (event_uid is UNIQUE)."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(self, snap: IncidentVitalRow) -> tuple[IncidentVitalRow, bool]:
+        """Insert a snapshot. Returns (row, created); a duplicate event_uid is
+        ignored at the DB layer (created=False) so an incident gets one snapshot."""
+        snap.created_at = snap.created_at or self.db.now_iso()
+        cur = self.db.execute(
+            """
+            INSERT OR IGNORE INTO incident_vitals (
+                event_uid, camera_id, confirmed_time, vitals_sample_id, heart_rate,
+                respiratory_rate, posture, phone_alert_score, computed_alert_level,
+                computed_alert_score, reason_codes, source_timestamp, received_at,
+                vitals_age_seconds, vitals_freshness, vitals_available, vitals_source,
+                synthetic, snapshot_version, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                snap.event_uid, snap.camera_id, snap.confirmed_time, snap.vitals_sample_id,
+                snap.heart_rate, snap.respiratory_rate, snap.posture, snap.phone_alert_score,
+                snap.computed_alert_level, snap.computed_alert_score, snap.reason_codes_json(),
+                snap.source_timestamp, snap.received_at, snap.vitals_age_seconds,
+                snap.vitals_freshness, 1 if snap.vitals_available else 0, snap.vitals_source,
+                1 if snap.synthetic else 0, snap.snapshot_version, snap.created_at,
+            ),
+        )
+        created = bool(cur.rowcount and cur.rowcount > 0)
+        existing = self.get_by_event(snap.event_uid)
+        return (existing or snap), created
+
+    def get_by_event(self, event_uid: str) -> IncidentVitalRow | None:
+        row = self.db.query_one("SELECT * FROM incident_vitals WHERE event_uid = ?", (event_uid,))
+        return IncidentVitalRow.from_row(row) if row else None
+
+    def list(
+        self, *, limit: int = 50, offset: int = 0, camera_id: str | None = None
+    ) -> list[IncidentVitalRow]:
+        if camera_id:
+            rows = self.db.query_all(
+                "SELECT * FROM incident_vitals WHERE camera_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (camera_id, limit, offset),
+            )
+        else:
+            rows = self.db.query_all(
+                "SELECT * FROM incident_vitals ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+            )
+        return [IncidentVitalRow.from_row(r) for r in rows]
+
+    def count(self) -> int:
+        row = self.db.query_one("SELECT COUNT(*) AS n FROM incident_vitals")
+        return int(row["n"]) if row else 0
+
+
 class Repositories:
     """Convenience bundle of all repositories over one database."""
 
@@ -327,3 +383,4 @@ class Repositories:
         self.vitals = VitalRepository(db)
         self.alerts = AlertRepository(db)
         self.devices = DeviceRepository(db)
+        self.incident_vitals = IncidentVitalRepository(db)

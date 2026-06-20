@@ -24,6 +24,7 @@ from vytallink.api.schemas import (
     VitalsIngest,
     device_to_dict,
     event_to_dict,
+    incident_vital_to_dict,
     vital_to_dict,
 )
 from vytallink.common.errors import NotFoundError, VytalLinkError
@@ -148,7 +149,11 @@ def _register_routes(app: FastAPI) -> None:
         repos = _svc(request).repos
         ev = repos.events.require(event_id)
         alerts = repos.alerts.list_for_event(event_id)
-        return event_to_dict(ev, alerts)
+        data = event_to_dict(ev, alerts)
+        # Attach the incident vitals snapshot (if one was captured at confirmation).
+        snap = repos.incident_vitals.get_by_event(event_id)
+        data["incident_vitals"] = incident_vital_to_dict(snap) if snap else None
+        return data
 
     @app.post("/api/events/{event_id}/label")
     async def label_event(request: Request, event_id: str, body: LabelRequest) -> dict[str, Any]:
@@ -225,12 +230,15 @@ def _register_routes(app: FastAPI) -> None:
         # malformed/invalid body is rejected by pydantic with 422. Neither leaks
         # internals, and the service never logs values or the full payload.
         row, idempotent = svc.ingest_vitals(body)
+        md = row.metadata or {}
         return {
             "accepted": True,
             "idempotent": idempotent,
             "device_id": row.device_id,
             "source_timestamp": row.timestamp,
-            "received_at": (row.metadata or {}).get("received_at"),
+            "received_at": md.get("received_at"),
+            "contract_form": md.get("contract_form"),
+            "accepted_fields": sorted(body.accepted_aliases.keys()),
         }
 
     @app.get("/api/patient")

@@ -160,6 +160,30 @@ def test_confidences_are_not_summed():
     assert "score" in ps["alert"] and ps["alert"]["score"] <= 3
 
 
+def test_phone_alert_score_does_not_override_deterministic_score():
+    # A high phone-provided alert_score is preserved as raw metadata but must NOT
+    # change the deterministic computed level (no clinical override).
+    v = _vital(hr=72.0)
+    v.metadata["phone_alert_score"] = 0.99
+    ps = _state([_cam("camera_1")], vital=v)
+    assert ps["vitals"]["phone_alert_score"] == 0.99
+    assert ps["alert"]["level"] == "normal"           # not escalated by the phone value
+    assert 0 <= ps["alert"]["score"] <= 3
+
+
+def test_offline_camera_is_sensor_warning_not_a_medical_conclusion():
+    ps = _state([_cam("camera_1", connected=False, age_s=None)], vital=_vital(hr=72.0))
+    assert R_VISION_UNAVAILABLE in ps["alert"]["reasons"]
+    assert R_FALL_CONFIRMED not in ps["alert"]["reasons"]
+    assert ps["alert"]["score"] >= 0                  # never negative
+
+
+def test_missing_vitals_not_treated_as_zero_risk():
+    # No vitals must surface as a reason, not silently read as "all good".
+    ps = _state([_cam("camera_1")], vital=None)
+    assert R_VITALS_UNAVAILABLE in ps["alert"]["reasons"]
+
+
 def test_raw_and_computed_are_distinguishable():
     ps = _state([_cam("camera_1")], vital=_vital(hr=72.0, rr=16.0, posture="upright"))
     # raw vitals preserved verbatim
