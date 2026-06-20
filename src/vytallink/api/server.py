@@ -8,12 +8,13 @@ without leaking stack traces or secrets.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vytallink import APP_NAME, __version__
@@ -70,6 +71,24 @@ def create_app(
 
 def _svc(request: Request) -> MonitoringService:
     return request.app.state.service
+
+
+def _video_authorized(request: Request, svc: MonitoringService) -> bool:
+    """Authorize a live-video request. When DASHBOARD_VIDEO_TOKEN is unset the
+    feed is open (flag-gated only); when set, an ``Authorization: Bearer <token>``
+    header is required. The token is never read from the URL and never logged."""
+    if not svc.video_token_required():
+        return True
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    return scheme.lower() == "bearer" and svc.check_video_token(token.strip())
+
+
+def _video_unauthorized() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"error": "unauthorized", "detail": "Valid video token required."},
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # --- error handling -------------------------------------------------------
@@ -148,12 +167,25 @@ def _register_routes(app: FastAPI) -> None:
         devices = _svc(request).repos.devices.list()
         return {"items": [device_to_dict(d) for d in devices], "returned": len(devices)}
 
+    def _latest_vital_payload(svc: MonitoringService) -> dict[str, Any]:
+        """Single source of truth for the latest-vital response (shared by the
+        canonical route and the legacy ``/latest`` alias)."""
+        v = svc.repos.vitals.latest()
+        if v is None:
+            return {"vital": None, "simulated": svc.simulation_mode}
+        return {"vital": vital_to_dict(v), "simulated": v.simulated}
+
     @app.get("/api/vitals/latest")
     async def latest_vital(request: Request) -> dict[str, Any]:
-        v = _svc(request).repos.vitals.latest()
-        if v is None:
-            return {"vital": None, "simulated": _svc(request).simulation_mode}
-        return {"vital": vital_to_dict(v), "simulated": v.simulated}
+        # Canonical latest-vital endpoint.
+        return _latest_vital_payload(_svc(request))
+
+    @app.get("/latest")
+    async def latest_vital_alias(request: Request) -> dict[str, Any]:
+        # Backward-compatible alias for the legacy iPhone vitals relay / prior
+        # VytalLink, which polled GET /latest. Identical response, schema, and
+        # no-vitals behavior as /api/vitals/latest (the canonical route).
+        return _latest_vital_payload(_svc(request))
 
     @app.get("/api/vitals")
     async def list_vitals(
@@ -172,6 +204,68 @@ def _register_routes(app: FastAPI) -> None:
             "total": repos.vitals.count(),
             "simulated": _svc(request).simulation_mode,
         }
+
+    # -- live camera feed (opt-in, development only; never saves footage) ---
+    @app.get("/api/camera/snapshot.jpg")
+    async def camera_snapshot(request: Request):
+        svc = _svc(request)
+        if not svc.live_video_enabled():
+            return JSONResponse(
+                status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
+            )
+        if not _video_authorized(request, svc):
+            return _video_unauthorized()
+        jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+        if jpeg is None:
+            return JSONResponse(
+                status_code=503, content={"error": "unavailable", "detail": "No frame available."}
+            )
+        return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/camera/stream")
+    async def camera_stream(request: Request):
+        svc = _svc(request)
+        if not svc.live_video_enabled():
+            return JSONResponse(
+                status_code=404, content={"error": "not_found", "detail": "Live video is disabled."}
+            )
+        if not _video_authorized(request, svc):
+            return _video_unauthorized()
+
+        frame_interval = 1.0 / max(0.1, svc.settings.relay_max_fps)
+
+        async def gen():
+            # Encode each frame OFF the event loop and cap the rate (RELAY_MAX_FPS)
+            # so the live feed never starves the API. Stops when the client
+            # disconnects; an encode error is logged (sanitized) and closes cleanly.
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    jpeg = await asyncio.to_thread(svc.latest_frame_jpeg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("Live MJPEG frame failed: %s", type(exc).__name__)
+                    break
+                if jpeg is not None:
+                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                await asyncio.sleep(frame_interval)
+
+        return StreamingResponse(
+            gen(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # -- detector debug (development only; no images/credentials/paths) -----
+    @app.get("/api/detector/debug")
+    async def detector_debug(request: Request):
+        svc = _svc(request)
+        if not svc.settings.is_development:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found", "detail": "Debug metrics are development-only."},
+            )
+        return svc.debug_metrics()
 
     # -- simulation controls (development + simulation only) ---------------
     @app.post("/api/simulation/fall")

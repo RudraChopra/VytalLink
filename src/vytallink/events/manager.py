@@ -30,6 +30,10 @@ log = get_logger("events.manager")
 
 
 class EventManager:
+    #: event_type stamped on events created while synthetic fall testing is active,
+    #: so they are explicitly distinguishable from real falls (not by confidence).
+    SYNTHETIC_EVENT_TYPE = "fall_synthetic"
+
     def __init__(
         self,
         repos: Repositories,
@@ -38,12 +42,16 @@ class EventManager:
         *,
         clock: Clock | None = None,
         simulated: bool = True,
+        synthetic: bool = False,
     ) -> None:
         self.repos = repos
         self.sm = state_machine
         self.dispatcher = dispatcher
         self.clock: Clock = clock or SystemClock()
         self.simulated = simulated
+        # When True, persisted events are tagged event_type='fall_synthetic' so a
+        # forced/validation fall is never mistaken for a real one.
+        self.synthetic = synthetic
         self._lock = asyncio.Lock()
         self.last_alert_results: list = []
 
@@ -80,7 +88,7 @@ class EventManager:
             self.repos.events.create(
                 EventRow(
                     event_uid=ev.event_uid,
-                    event_type=ev.event_type,
+                    event_type=self.SYNTHETIC_EVENT_TYPE if self.synthetic else ev.event_type,
                     state=ev.state.value,
                     start_time=isoformat(ev.start_time),
                     confirmed_time=isoformat(ev.confirmed_time),

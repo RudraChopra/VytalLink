@@ -87,3 +87,22 @@ def test_health_payload_is_credential_safe(manual_clock: ManualClock):
     assert h["frame_count"] == 1
     assert h["opened"] is True
     assert "password" not in str(h).lower()
+
+
+def test_open_with_no_frames_is_healthy(manual_clock: ManualClock):
+    """Regression: a simulated camera that is open but has produced zero frames
+    (the simulation pipeline drives detections directly) must report healthy —
+    not stale/degraded — because it has no live video to be stale about."""
+    cam = SimulatedCamera(clock=manual_clock, stale_timeout=5.0)
+    cam.open()
+    # No read() yet: frame_count == 0, no frame timestamp available.
+    manual_clock.advance(100.0)  # well past stale_timeout, still no frames
+    assert cam.frame_count == 0
+    assert cam.is_stale() is False
+    assert cam.status() is HealthStatus.OK
+    h = cam.health()
+    assert h["status"] == "ok"
+    assert h["stale"] is False
+    assert h["frame_count"] == 0
+    assert h["simulated"] is True
+    assert h["live_video_available"] is False

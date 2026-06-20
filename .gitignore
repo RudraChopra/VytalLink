@@ -87,6 +87,9 @@ logs/*
 *.pid
 run/
 
+# Ultralytics prediction/run outputs (footage; never commit)
+runs/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
@@ -94,3 +97,7 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Soak / diagnostics output (metrics only — never images). Reusable harness
+# scripts live in scripts/ (committed); their output stays here, ignored.
+/diagnostics/

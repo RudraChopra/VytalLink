@@ -1,5 +1,6 @@
 """Environment-based configuration for VytalLink."""
 
+from vytallink.config.cameras import CameraConfig, cameras_from_env
 from vytallink.config.settings import (
     PROJECT_ROOT,
     DetectorMode,
@@ -19,6 +20,8 @@ __all__ = [
     "VisionMode",
     "DetectorMode",
     "WearableMode",
+    "CameraConfig",
+    "cameras_from_env",
     "get_settings",
     "load_settings",
     "reset_settings_cache",

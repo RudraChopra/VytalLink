@@ -56,10 +56,16 @@ class CameraProvider(abc.ABC):
         self._consecutive_failures = 0
         self._next_retry_mono: float = 0.0
         self._last_error: str | None = None
+        self._open_count = 0  # successful opens; reconnects = open_count - 1
 
     # -- describe ----------------------------------------------------------
     #: A human-readable, credential-safe description of the source.
     description: str = "camera"
+    #: True when the provider maintains a background latest-frame buffer (so
+    #: :meth:`peek_latest` is the source of truth and returning ``None`` means
+    #: "no frame yet", not "this source has no buffer"). Sequential sources
+    #: (e.g. a video file) leave this False and are read via :meth:`read`.
+    has_latest_buffer: bool = False
 
     @property
     def is_open(self) -> bool:
@@ -74,6 +80,7 @@ class CameraProvider(abc.ABC):
         try:
             self._open_source()
             self._opened = True
+            self._open_count += 1
             self._consecutive_failures = 0
             self._last_error = None
             log.info("Camera %s opened (%s)", self.source_id, self.description)
@@ -189,8 +196,23 @@ class CameraProvider(abc.ABC):
             "last_frame_age_seconds": last_age,
             "stale": self.is_stale(),
             "consecutive_failures": self._consecutive_failures,
+            "reconnects": max(0, self._open_count - 1),
             "last_error": self._last_error,
         }
+
+    # -- freshest-frame peek (non-consuming) -------------------------------
+    def peek_latest(self) -> tuple[Any, int, float] | None:
+        """Return ``(image, seq, age_seconds)`` for the freshest decoded frame
+        WITHOUT consuming it or touching read counters, or ``None`` when no pixel
+        frame is held (e.g. the simulated camera).
+
+        ``seq`` increments once per genuinely new captured frame, so a consumer
+        can de-duplicate (skip re-processing a frame the relay merely re-sent).
+        ``age_seconds`` is measured from capture into the latest-frame buffer.
+        Used by the dashboard/relay (serve the freshest frame, decoupled from the
+        detection loop) and by the detection loop's stale-drop / de-dup logic.
+        """
+        return None
 
     # -- hooks for subclasses ----------------------------------------------
     @abc.abstractmethod

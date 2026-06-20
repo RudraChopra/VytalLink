@@ -49,15 +49,22 @@ function renderHealth(h) {
   $("s-camera").innerHTML = chip(h.camera && h.camera.status);
   $("s-detector").innerHTML = chip(h.detector && h.detector.status);
   $("s-wearable").innerHTML = chip(h.wearable && h.wearable.status);
-  $("s-gpu").textContent = h.gpu && h.gpu.available ? "available" : "unavailable";
+  // Inference device: show the actual accelerator (Apple MPS / CUDA / CPU).
+  const det0 = h.detector || {};
+  $("s-gpu").textContent = det0.device_label || det0.device || "—";
   $("s-db").innerHTML = chip(h.database && h.database.status);
   $("s-uptime").textContent = fmtUptime(h.uptime_seconds);
   $("version").textContent = "v" + (h.version || "?");
 
-  // Simulation indicator.
-  const sim = h.simulation && h.simulation.active;
-  $("sim-indicator").hidden = !sim;
-  $("vitals-sim").hidden = !sim;
+  // Exactly ONE top-level mode badge: SIMULATION xor LIVE (driven by the
+  // single authoritative flag h.simulation.active = vision in simulation).
+  const isSim = !!(h.simulation && h.simulation.active);
+  $("sim-indicator").hidden = isSim ? false : true;
+  $("live-indicator").hidden = isSim ? true : false;
+  $("vitals-sim").hidden = !isSim;
+
+  renderHardware(h);
+  renderLiveVideo(h);
 
   // Warnings.
   const warnings = [];
@@ -71,6 +78,109 @@ function renderHealth(h) {
   // Dev controls visibility.
   CONTROLS_ENABLED = !!(h.simulation && h.simulation.controls_enabled);
   $("dev-controls").hidden = !CONTROLS_ENABLED;
+}
+
+// --- live video -----------------------------------------------------------
+// The token (when the feed is protected) lives ONLY in memory and is sent via
+// the Authorization: Bearer header — never in a URL, cookie, or the page source.
+let VIDEO_TOKEN = null;
+let videoTimer = null;
+
+function stopProtectedFeed() {
+  if (videoTimer) { clearInterval(videoTimer); videoTimer = null; }
+  const img = $("live-img");
+  if (img && img.src && img.src.startsWith("blob:")) { URL.revokeObjectURL(img.src); img.removeAttribute("src"); }
+}
+
+function startProtectedFeed() {
+  if (videoTimer) return;
+  const img = $("live-img");
+  const poll = async () => {
+    try {
+      const res = await fetch("/api/camera/snapshot.jpg", {
+        headers: { Authorization: "Bearer " + VIDEO_TOKEN }, cache: "no-store",
+      });
+      if (res.status === 401) {
+        VIDEO_TOKEN = null; stopProtectedFeed();
+        $("video-unlock").hidden = false;
+        const e = $("video-error"); e.hidden = false; e.textContent = "token rejected";
+        return;
+      }
+      if (res.ok && img) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const old = img.src; img.src = url;
+        if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+      }
+    } catch (_) { /* transient; keep polling */ }
+  };
+  videoTimer = setInterval(poll, 200); // ~5 fps
+  poll();
+}
+
+function unlockVideo() {
+  const t = $("video-token-input").value.trim();
+  if (!t) return;
+  VIDEO_TOKEN = t;
+  $("video-token-input").value = "";
+  $("video-unlock").hidden = true;
+  $("video-error").hidden = true;
+  startProtectedFeed();
+}
+
+function renderLiveVideo(h) {
+  const liveOn = !!h.live_video;
+  const card = $("live-card");
+  if (!card) return;
+  card.hidden = !liveOn;
+  const img = $("live-img");
+  if (!liveOn) {                       // feature off
+    stopProtectedFeed();
+    if (img) img.removeAttribute("src");
+    $("video-unlock").hidden = true;
+    return;
+  }
+  if (h.video_protected) {             // token required
+    if (VIDEO_TOKEN === null) {
+      $("video-unlock").hidden = false;
+      if (img && img.src && !img.src.startsWith("blob:")) img.removeAttribute("src");
+    } else {
+      $("video-unlock").hidden = true;
+      startProtectedFeed();
+    }
+  } else {                             // open feed: smooth MJPEG via <img>
+    stopProtectedFeed();
+    $("video-unlock").hidden = true;
+    if (img && !img.getAttribute("src")) img.setAttribute("src", "/api/camera/stream");
+  }
+}
+
+function renderHardware(h) {
+  const cam = h.camera || {};
+  const det = h.detector || {};
+  const gpu = h.gpu || {};
+  const sim = !!(h.simulation && h.simulation.active);
+  const mode = $("hw-mode");
+  // Transport detail (e.g. "http_mjpeg") — the single LIVE/SIMULATION badge lives
+  // in the top bar; this tag is just the source kind, never a duplicate badge.
+  mode.textContent = h.mode || (sim ? "simulation" : "live");
+  mode.className = "tag " + (sim ? "" : "tag-live");
+  // Never show credentials or a model path — camera_name is already sanitized.
+  $("hw-camera").textContent = h.camera_name || cam.description || "—";
+  $("hw-camera-status").innerHTML = chip(cam.status);
+  $("hw-camera-fps").textContent = cam.effective_fps != null ? cam.effective_fps : "—";
+  $("hw-resolution").textContent = cam.resolution ? cam.resolution.join("×") : "—";
+  $("hw-reconnects").textContent = cam.reconnects != null ? cam.reconnects : "—";
+  $("hw-dropped").textContent = cam.frames_dropped != null ? cam.frames_dropped : "—";
+  $("hw-device").textContent = det.device_label || det.device || (sim ? "n/a (sim)" : "—");
+  $("hw-inf-fps").textContent = det.inference_fps != null ? det.inference_fps : "—";
+  $("hw-inf-ms").textContent = det.avg_inference_ms != null ? det.avg_inference_ms + " ms" : "—";
+  // Accelerator detail — shows "Apple MPS available (CUDA unavailable)" etc.
+  $("hw-gpu").textContent = (gpu && gpu.detail)
+    || det.device_label
+    || (sim ? "n/a (sim)" : "—");
+  $("hw-last-frame").textContent = fmtTime(h.latest_frame_time);
+  $("hw-last-inf").textContent = fmtTime(h.latest_inference_time);
 }
 
 function renderStatus(s) {
@@ -181,6 +291,10 @@ function init() {
   $("btn-fall").addEventListener("click", () => sim("fall"));
   $("btn-normal").addEventListener("click", () => sim("normal"));
   $("btn-reset").addEventListener("click", () => sim("reset"));
+  const unlockBtn = $("video-unlock-btn");
+  if (unlockBtn) unlockBtn.addEventListener("click", unlockVideo);
+  const tokenInput = $("video-token-input");
+  if (tokenInput) tokenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") unlockVideo(); });
   refresh();
   setInterval(refresh, POLL_MS);
 }

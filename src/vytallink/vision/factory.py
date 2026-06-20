@@ -26,17 +26,36 @@ def build_camera(settings: Settings, clock: Clock | None = None) -> CameraProvid
         from vytallink.vision.rtsp import RTSPCamera
 
         return RTSPCamera(settings.camera_connection_string(), source_id=sid, clock=clock)
+    if settings.vision_mode == VisionMode.HTTP_MJPEG:
+        from vytallink.vision.http_source import HttpCamera
+
+        return HttpCamera(
+            stream_url=settings.camera_http_stream_url,
+            snapshot_url=settings.camera_http_snapshot_url,
+            bearer_token=settings.camera_http_bearer_token,
+            source_id=sid,
+            clock=clock,
+        )
     raise ValueError(f"Unknown vision mode: {settings.vision_mode}")  # pragma: no cover
 
 
-def build_detector(settings: Settings) -> FallDetector:
+def build_detector(settings: Settings, clock: Clock | None = None) -> FallDetector:
     """Construct the fall detector for the configured DETECTOR_MODE."""
     if settings.detector_mode == DetectorMode.SIMULATION:
         return SimulatedFallDetector()
     if settings.detector_mode == DetectorMode.YOLO:
         from vytallink.vision.detector_yolo import YoloFallDetector
 
-        return YoloFallDetector(settings.model_path, image_size=settings.image_size)
+        return YoloFallDetector(
+            settings.model_path,
+            image_size=settings.image_size,
+            confidence=settings.confidence_threshold,
+            require_transition=settings.require_fall_transition,
+            min_fallen_box_area_frac=settings.detector_min_fallen_box_area_frac,
+            reject_edge_clipped_fallen=settings.detector_reject_edge_clipped_fallen,
+            edge_margin_frac=settings.detector_edge_margin_frac,
+            clock=clock,
+        )
     if settings.detector_mode == DetectorMode.TENSORRT:
         # TensorRT export/engine path is intentionally not implemented until the
         # real model loads and ordinary GPU inference is confirmed.
